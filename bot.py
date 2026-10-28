@@ -20,7 +20,9 @@ import requests
 from requests_oauthlib import OAuth1
 
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
+TG_CHAT_ID = re.sub(r"^(https?://)?t\.me/", "@", os.environ["TELEGRAM_CHAT_ID"].strip())
+if TG_CHAT_ID and not TG_CHAT_ID.startswith(("@", "-")) and not TG_CHAT_ID.isdigit():
+    TG_CHAT_ID = "@" + TG_CHAT_ID  # '@' 없이 채널 아이디만 넣은 경우
 # 승인 요청을 받을 사람의 텔레그램 숫자 ID. 봇에게 /start를 보내면 봇이 알려준다.
 TG_ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
@@ -307,15 +309,43 @@ def handle_callback(cq, auth):
     return True
 
 
+def status_report():
+    """설정 점검 결과. 로그를 보지 않아도 무엇이 문제인지 알 수 있게 한다."""
+    lines = [f"• 채널 설정값: {TG_CHAT_ID or '(비어 있음)'}"]
+    try:
+        chat = tg("getChat", chat_id=TG_CHAT_ID)
+        lines.append(f"• 채널 찾음: {chat.get('title')} ✅")
+        me = tg("getMe")
+        member = tg("getChatMember", chat_id=TG_CHAT_ID, user_id=me["id"])
+        if member["status"] in ("administrator", "creator"):
+            lines.append(f"• 봇(@{me['username']})이 채널 관리자 ✅")
+        else:
+            lines.append(f"• 봇(@{me['username']})이 채널 관리자가 아닙니다 ❌ → 채널 관리자로 추가해 주세요")
+    except Exception as e:
+        lines.append(f"• 채널 확인 실패 ❌ ({e})\n  → 봇이 채널 관리자인지, TELEGRAM_CHAT_ID가 맞는지 확인해 주세요")
+    lines.append(f"• 관리자 ID: {TG_ADMIN_ID or '(비어 있음) ❌'}")
+    x_keys = ["X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET"]
+    missing = [k for k in x_keys if not os.environ.get(k)]
+    lines.append("• X 키 4개 ✅" if not missing else f"• X 키 없음 ❌: {', '.join(missing)}")
+    return "\n".join(lines)
+
+
 def handle_dm(msg):
     text = msg.get("text") or ""
-    if msg["chat"]["type"] == "private" and text.startswith(("/start", "/id")):
-        print(f"[DM /start] user {msg['from']['id']}")
-        if not DRY_RUN:
-            tg_quiet("sendMessage", chat_id=msg["chat"]["id"],
-                     text=f"안녕하세요! 회원님의 텔레그램 ID는\n\n{msg['from']['id']}\n\n"
-                          "입니다. 이 숫자를 GitHub Secrets의 TELEGRAM_ADMIN_ID에 넣으면 "
-                          "새 공지마다 여기로 승인 요청이 옵니다.")
+    if msg["chat"]["type"] != "private" or not text.startswith(("/start", "/id", "/status")):
+        return
+    uid = str(msg["from"]["id"])
+    print(f"[DM {text.split()[0]}] user {uid}")
+    if DRY_RUN:
+        return
+    if TG_ADMIN_ID and uid == TG_ADMIN_ID:
+        reply = "✅ 관리자로 등록되어 있습니다. 새 공지가 올라오면 여기로 승인 요청이 옵니다.\n\n"
+    else:
+        reply = (f"회원님의 텔레그램 ID는\n\n{uid}\n\n입니다. 이 숫자를 GitHub Secrets의 "
+                 "TELEGRAM_ADMIN_ID에 넣으면 새 공지마다 여기로 승인 요청이 옵니다.\n\n")
+    if not TG_ADMIN_ID or uid == TG_ADMIN_ID:
+        reply += "[설정 점검]\n" + status_report()
+    tg_quiet("sendMessage", chat_id=msg["chat"]["id"], text=reply)
 
 
 # ---------------------------------------------------------------- 메인 루프
@@ -341,6 +371,10 @@ def group_items(updates):
                 by_group[gid] = len(items)
             items.append((uid, "post", [msg]))
         else:
+            if "channel_post" in u:
+                c = u["channel_post"]["chat"]
+                items.append((uid, "other_channel", c))
+                continue
             items.append((uid, "skip", None))
     return items
 
@@ -375,6 +409,13 @@ def process(updates, auth):
                     failed = True
         elif kind == "dm":
             handle_dm(payload)
+        elif kind == "other_channel":
+            note = (f"설정({TG_CHAT_ID})과 다른 채널의 글이라 무시했습니다: "
+                    f"@{payload.get('username')} / {payload['id']}")
+            print(f"[무시] {note}")
+            if TG_ADMIN_ID and not DRY_RUN:
+                tg_quiet("sendMessage", chat_id=TG_ADMIN_ID,
+                         text=f"⚠️ {note}\n이 채널이 맞다면 TELEGRAM_CHAT_ID를 고쳐 주세요.")
         done_id = uid
     return done_id, failed
 
