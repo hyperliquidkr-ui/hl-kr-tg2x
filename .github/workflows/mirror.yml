@@ -2,7 +2,7 @@ name: Telegram → X mirror
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # 5분마다 (GitHub 사정에 따라 몇 분 늦어질 수 있음)
+    - cron: "*/5 * * * *"  # 다음 실행을 항상 대기열에 올려 두기 위한 것 (GitHub 사정으로 늦어질 수 있음)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,3 +36,4 @@ jobs:
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
           X_MAX_WEIGHT: ${{ vars.X_MAX_WEIGHT || '25000' }}  # Premium 계정 기준. 일반 계정이면 Variables에 280
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          RUN_SECS: "3300"  # 한 번 실행되면 55분간 대기하며 바로 반응. 끝나면 대기 중인 다음 실행이 이어받음
