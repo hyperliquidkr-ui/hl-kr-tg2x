@@ -1,67 +1,59 @@
-# Hyperliquid KR 텔레그램 → X 자동 미러
+# Hyperliquid KR 텔레그램 → X 미러 (DM 승인 후 게시)
 
-텔레그램 공지방에 올라온 글을 GitHub Actions가 **5분마다** 확인해서 KR X(트위터) 계정에 그대로 올립니다.
+텔레그램 공지 채널에 새 글이 올라오면, 봇이 관리자 텔레그램 DM으로 원문과
+**[✅ X에 게시] [❌ 건너뛰기]** 버튼을 보냅니다. **게시**를 누른 글만 KR X(트위터) 계정에 올라갑니다.
 
+- GitHub Actions가 5분마다 실행되고, 실행될 때마다 약 4분간 대기하며 바로 반응합니다
+  (GitHub 예약 실행이 늦어지면 반응도 몇 분 늦어질 수 있습니다)
 - 글 / 사진(앨범 최대 4장) / 숨은 링크(“여기를 클릭”)를 지원합니다
-- Premium 계정 기준으로 긴 글도 한 트윗으로 올립니다 (일반 계정으로 설정하면 자동으로 스레드로 나눔)
+- Premium 계정 기준으로 긴 글도 한 트윗으로 올립니다
 - 동영상·파일·투표는 빼고 글만 올립니다
-- X 게시에 실패하면 그 글부터 다음 실행 때 다시 시도합니다 (텔레그램은 24시간 보관)
+- X 게시에 실패하면 DM에 이유가 표시되고 버튼이 남아 있어서, 다시 누르면 재시도합니다
+- 승인 버튼은 `TELEGRAM_ADMIN_ID`로 등록한 사람만 누를 수 있습니다
 
 ---
 
-## 1. 텔레그램 봇 만들기
+## 1. 텔레그램 봇
 
-1. 텔레그램에서 **@BotFather** → `/newbot` → 이름과 아이디를 입력하면 **봇 토큰**(`123456:ABC...`)이 나옵니다.
-2. 공지방에 봇을 추가합니다.
-   - **채널**이면: 채널 설정 → 관리자 → 봇 추가 (권한은 기본값이면 충분)
-   - **그룹**이면: 봇을 관리자로 추가 (관리자가 아니면 일반 메시지를 못 받습니다)
-3. 공지방에 테스트 글을 하나 올린 뒤, 브라우저에서 아래 주소를 엽니다 (`<토큰>`을 바꿔서):
-   `https://api.telegram.org/bot<토큰>/getUpdates`
-   결과의 `"chat":{"id":-100xxxxxxxxxx` 숫자가 **채팅 ID**입니다. (`-100`까지 포함)
+1. **@BotFather** → `/newbot` → 이름과 아이디를 입력하면 **봇 토큰**(`123456:ABC...`)이 나옵니다.
+2. 공지 채널 → 관리자 → 봇을 관리자로 추가합니다 (권한은 기본값이면 충분).
+3. 관리자 본인이 텔레그램에서 봇을 검색해 **시작(/start)** 을 누릅니다.
+   봇은 먼저 말을 걸 수 없어서 이 단계가 꼭 필요합니다.
+   텔레그램 토큰이 GitHub에 등록되어 있으면, 봇이 몇 분 안에 **관리자 ID(숫자)** 를 답장으로 알려줍니다.
 
-## 2. X API 키 받기
+## 2. X API 키
 
-1. KR 계정으로 로그인해서 <https://developer.x.com> 가입 → 프로젝트/앱을 만듭니다.
+1. KR 계정으로 로그인해서 <https://developer.x.com> 가입 → 앱을 만듭니다.
 2. 앱 설정 → **User authentication settings** → App permissions를 **Read and write**로 바꿉니다.
-   (콜백 URL은 아무 주소나 넣어도 됩니다. 예: `https://example.com`)
-3. **Keys and tokens** 탭에서 아래 4개를 발급합니다.
-   - API Key, API Key Secret
-   - Access Token, Access Token Secret (**권한을 Read and write로 바꾼 뒤에** 발급/재발급해야 함)
-4. 무료 등급은 월 게시 수 제한이 있으니 개발자 포털에서 한도를 확인해 주세요.
+3. **Keys and tokens** 탭에서 API Key / API Key Secret / Access Token / Access Token Secret을 발급합니다.
+   (Access Token은 **권한을 Read and write로 바꾼 뒤에** 발급해야 합니다)
 
-## 3. GitHub에 올리기
+## 3. GitHub Secrets
 
-1. GitHub에서 새 저장소를 만듭니다. **Public을 추천**합니다.
-   - Public 저장소는 Actions가 무료로 무제한입니다. 키는 Secrets에 들어가므로 공개되지 않습니다.
-   - Private는 무료 한도가 월 2,000분이라 5분마다 돌리면 한도를 넘습니다.
-2. 이 폴더의 파일을 그대로 올립니다 (`bot.py`, `requirements.txt`, `.github/workflows/mirror.yml`).
-3. 저장소 → **Settings → Secrets and variables → Actions → New repository secret** 에 6개를 넣습니다.
+저장소 → **Settings → Secrets and variables → Actions → New repository secret** 에 7개를 넣습니다.
 
-   | 이름 | 값 |
-   |---|---|
-   | `TELEGRAM_BOT_TOKEN` | 1단계 봇 토큰 |
-   | `TELEGRAM_CHAT_ID` | 공개 채널이면 `@채널아이디`, 비공개 채널이면 숫자 ID (예: `-1001234567890`) |
-   | `X_API_KEY` | API Key |
-   | `X_API_SECRET` | API Key Secret |
-   | `X_ACCESS_TOKEN` | Access Token |
-   | `X_ACCESS_TOKEN_SECRET` | Access Token Secret |
+| 이름 | 값 |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | 봇 토큰 |
+| `TELEGRAM_CHAT_ID` | `@Hyperliquid_KR_announce` |
+| `TELEGRAM_ADMIN_ID` | 봇이 /start 답장으로 알려준 숫자 |
+| `X_API_KEY` | API Key |
+| `X_API_SECRET` | API Key Secret |
+| `X_ACCESS_TOKEN` | Access Token |
+| `X_ACCESS_TOKEN_SECRET` | Access Token Secret |
 
-4. 기본값은 **X Premium 계정 기준**이라 긴 글도 한 트윗으로 올립니다. 나중에 Premium을 해지하면 같은 화면의 **Variables** 탭에 `X_MAX_WEIGHT` = `280`을 넣으세요. 그러면 자동으로 스레드로 나눕니다.
+`TELEGRAM_ADMIN_ID`를 넣기 전에 올라온 공지는 승인 요청 없이 건너뜁니다 (X에도 올리지 않음).
 
-## 4. 테스트 → 실제 운영
+Premium을 해지하면 같은 화면의 **Variables** 탭에 `X_MAX_WEIGHT` = `280`을 넣으세요. 긴 글을 스레드로 나눕니다.
 
-1. 저장소 → **Actions** 탭 → “Telegram → X mirror” → **Run workflow** (테스트 모드 체크된 상태로 실행).
-   로그에 올라갈 트윗 내용이 나오는지 확인합니다. 이때는 X에 올리지 않습니다.
-2. 문제가 없으면 그대로 두세요. 5분마다 자동으로 실제 게시가 시작됩니다.
+## 4. 테스트
 
-> ⚠️ 1단계의 테스트 글도 처음 실행 때 X에 올라갑니다. 원치 않으면 첫 실제 실행 전에 텔레그램에서 지우거나,
-> 브라우저에서 `https://api.telegram.org/bot<토큰>/getUpdates?offset=-1` 을 한 번 열어 이전 글을 비워 주세요.
-> (마지막 1개는 남으니 그 뒤에 한 번 더 열면 됩니다.)
+Actions 탭 → “Telegram → X mirror” → **Run workflow** (테스트 모드 체크).
+로그만 남기고 아무것도 보내지 않습니다. 이후에는 5분마다 자동으로 실제 운영됩니다.
 
 ## 알아두면 좋은 점
 
-- GitHub 예약 실행은 바쁠 때 5~15분 정도 늦어질 수 있습니다.
-- Public 저장소에 **60일 동안 커밋이 없으면** GitHub가 예약 실행을 멈추고 메일을 보냅니다. 메일의 버튼이나 Actions 탭에서 다시 켜면 됩니다.
-- 게시에 실패하면 GitHub가 실패 알림 메일을 보내고, 로그에 X의 에러 메시지가 남습니다.
-- 텔레그램에서 **수정한 글**은 다시 올리지 않습니다.
-- 이 봇 토큰은 이 용도로만 쓰세요. 같은 토큰을 다른 프로그램(webhook)에서 쓰면 동작하지 않습니다.
+- 승인 요청을 **24시간 안에** 눌러야 합니다 (텔레그램 보관 기한).
+- Public 저장소에 **60일 동안 커밋이 없으면** GitHub가 예약 실행을 멈추고 메일을 보냅니다. Actions 탭에서 다시 켜면 됩니다.
+- 텔레그램에서 **수정한 글**은 다시 승인 요청하지 않습니다. 단, 승인 버튼을 누를 때 최신 내용으로 올라갑니다.
+- 이 봇 토큰은 이 용도로만 쓰세요. 다른 프로그램(webhook)에서 같이 쓰면 동작하지 않습니다.

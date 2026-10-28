@@ -1,8 +1,13 @@
-"""Telegram 공지방 → X(트위터) 미러 봇.
+"""Telegram 공지 채널 → X(트위터) 미러 봇 (관리자 DM 승인 후 게시).
 
-GitHub Actions에서 몇 분마다 실행된다. 텔레그램 getUpdates로 아직 처리하지 않은
-새 글을 받아 X에 올리고, 성공한 글까지만 텔레그램에 '처리 완료'로 확인(offset)한다.
-그래서 별도의 상태 파일이 필요 없고, 실패한 글은 다음 실행 때 다시 시도된다.
+GitHub Actions에서 5분마다 실행되고, 한 번 실행되면 RUN_SECS 동안 텔레그램을
+long polling 하면서 바로바로 반응한다.
+
+1. 채널에 새 공지가 올라오면 관리자 DM으로 원문을 전달하고 [게시]/[건너뛰기] 버튼을 보낸다.
+2. 관리자가 [게시]를 누르면 그 공지를 X에 올린다.
+
+처리한 업데이트는 텔레그램 offset으로 확인하므로 별도의 상태 저장이 필요 없다.
+버튼에는 채널 메시지 번호만 담고, 게시할 때 원문을 다시 가져와 쓴다.
 (텔레그램은 확인되지 않은 업데이트를 24시간 보관한다.)
 """
 
@@ -10,19 +15,21 @@ import os
 import re
 import sys
 import time
-import json
 
 import requests
 from requests_oauthlib import OAuth1
 
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
+# 승인 요청을 받을 사람의 텔레그램 숫자 ID. 봇에게 /start를 보내면 봇이 알려준다.
+TG_ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 # X Premium 계정이면 25000, 아니면 280 (한글은 1글자를 2로 계산하므로 약 140자)
 MAX_WEIGHT = int(os.environ.get("X_MAX_WEIGHT") or 280)
-# 앨범(사진 여러 장)이 올라가는 도중에 실행되면 일부만 올라갈 수 있어서,
-# 이 시간(초)보다 최근 앨범은 다음 실행으로 미룬다.
-ALBUM_SETTLE_SECS = 90
+# 한 번 실행될 때 텔레그램을 기다리는 시간(초). cron 간격(5분)보다 조금 짧게.
+RUN_SECS = 0 if DRY_RUN else int(os.environ.get("RUN_SECS") or 240)
+# 앨범(사진 여러 장)이 올라가는 도중이면 일부만 잡힐 수 있어서 잠시 기다렸다 처리한다.
+ALBUM_SETTLE_SECS = 20
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 X_API = "https://api.x.com/2"
@@ -31,11 +38,18 @@ X_API = "https://api.x.com/2"
 # ---------------------------------------------------------------- Telegram
 
 def tg(method, **params):
-    r = requests.get(f"{TG_API}/{method}", params=params, timeout=30)
+    r = requests.post(f"{TG_API}/{method}", json=params, timeout=params.get("timeout", 0) + 30)
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram {method} 실패: {data.get('description')}")
     return data["result"]
+
+
+def tg_quiet(method, **params):
+    try:
+        return tg(method, **params)
+    except Exception as e:
+        print(f"  (무시) {e}")
 
 
 def tg_download(file_id):
@@ -50,11 +64,6 @@ def is_target(chat):
     if TG_CHAT_ID.startswith("@"):
         return (chat.get("username") or "").lower() == TG_CHAT_ID[1:].lower()
     return str(chat["id"]) == TG_CHAT_ID
-
-
-def post_of(update):
-    # 채널은 channel_post, 그룹은 message 로 들어온다. 수정된 글은 무시한다.
-    return update.get("channel_post") or update.get("message")
 
 
 def with_hidden_links(text, entities):
@@ -78,6 +87,10 @@ def post_text(msg):
     if "caption" in msg:
         return with_hidden_links(msg["caption"], msg.get("caption_entities"))
     return ""
+
+
+def has_content(msgs):
+    return any(post_text(m) or m.get("photo") for m in msgs)
 
 
 # ---------------------------------------------------------------- X
@@ -180,93 +193,227 @@ def split_text(text, limit, seps=("\n\n", "\n", " ")):
     return [c.strip() for c in out if c.strip()]
 
 
-# ---------------------------------------------------------------- 메인
-
-def group_posts(updates):
-    """앨범(media_group_id가 같은 여러 메시지)을 하나의 글로 묶는다."""
-    posts = []  # [(마지막 update_id, [msg, ...])]
-    by_group = {}
-    for u in updates:
-        msg = post_of(u)
-        if not msg or not is_target(msg["chat"]):
-            posts.append((u["update_id"], []))  # 대상이 아닌 업데이트: 확인만 한다
-            continue
-        gid = msg.get("media_group_id")
-        if gid and gid in by_group:
-            idx = by_group[gid]
-            posts[idx] = (u["update_id"], posts[idx][1] + [msg])
-            continue
-        if gid:
-            by_group[gid] = len(posts)
-        posts.append((u["update_id"], [msg]))
-    return posts
-
+# ---------------------------------------------------------------- X 게시
 
 def mirror(msgs, auth):
+    """공지를 X에 올리고 첫 트윗 주소를 돌려준다. 이미 올라간 내용이면 None."""
     text = "\n".join(t for t in (post_text(m) for m in msgs) if t)
     photos = [m["photo"][-1]["file_id"] for m in msgs if m.get("photo")][:4]
     skipped = [k for m in msgs for k in ("video", "animation", "document", "poll") if k in m]
     if skipped:
         print(f"  ! 지원하지 않는 첨부({', '.join(skipped)})는 빼고 올립니다")
-    chunks = split_text(text, MAX_WEIGHT)
-    if not chunks and not photos:
-        print("  - 올릴 내용이 없어 건너뜁니다")
-        return
+    chunks = split_text(text, MAX_WEIGHT) or [""]
 
-    print(f"  트윗 {max(len(chunks), 1)}개, 사진 {len(photos)}장")
-    for i, c in enumerate(chunks or [""]):
+    print(f"  트윗 {len(chunks)}개, 사진 {len(photos)}장")
+    for i, c in enumerate(chunks):
         print(f"  --- [{i + 1}] (weight {weight(c)}/{MAX_WEIGHT})\n{c}")
     if DRY_RUN:
-        return
+        return None
 
     media_ids = [x_upload_image(tg_download(f), auth) for f in photos]
-    reply_to = None
-    for i, chunk in enumerate(chunks or [""]):
+    first = reply_to = None
+    for i, chunk in enumerate(chunks):
         try:
             reply_to = x_tweet(chunk, auth, media_ids if i == 0 else None, reply_to)
+            first = first or reply_to
             print(f"  ✓ 게시됨: https://x.com/i/status/{reply_to}")
         except DuplicateTweet:
             print("  - 이미 올라간 내용이라 건너뜁니다")
             if i == 0:
-                return
+                return None
+    return f"https://x.com/i/status/{first}"
+
+
+# ---------------------------------------------------------------- 승인 흐름
+
+def encode_ids(ids):
+    s = ",".join(map(str, ids))
+    return s if len(s) <= 60 else f"{ids[0]}-{ids[-1]}"  # callback_data는 64바이트 제한
+
+
+def decode_ids(s):
+    if "-" in s:
+        a, b = map(int, s.split("-"))
+        return list(range(a, b + 1))
+    return [int(x) for x in s.split(",")]
+
+
+def ask_approval(msgs):
+    ids = [m["message_id"] for m in msgs]
+    print(f"[새 공지 #{ids[0]}] 관리자에게 승인 요청")
+    if DRY_RUN:
+        return
+    tg("forwardMessages", chat_id=TG_ADMIN_ID, from_chat_id=msgs[0]["chat"]["id"], message_ids=ids)
+    data = encode_ids(ids)
+    tg("sendMessage", chat_id=TG_ADMIN_ID,
+       text="⬆️ 위 공지를 X(트위터)에 올릴까요?",
+       reply_markup={"inline_keyboard": [[
+           {"text": "✅ X에 게시", "callback_data": f"ok:{data}"},
+           {"text": "❌ 건너뛰기", "callback_data": f"no:{data}"},
+       ]]})
+
+
+def fetch_posts(ids):
+    """채널 원문을 관리자 DM으로 잠깐 전달해 내용을 읽고 바로 지운다."""
+    msgs = []
+    for i in ids:
+        try:
+            m = tg("forwardMessage", chat_id=TG_ADMIN_ID, from_chat_id=TG_CHAT_ID,
+                   message_id=i, disable_notification=True)
+        except RuntimeError as e:
+            if "not found" in str(e).lower():
+                continue  # 원본이 지워졌거나 앨범 번호 범위에 없는 메시지
+            raise
+        msgs.append(m)
+        tg_quiet("deleteMessage", chat_id=TG_ADMIN_ID, message_id=m["message_id"])
+    return msgs
+
+
+def handle_callback(cq, auth):
+    btn = cq.get("message") or {}
+    if str(cq["from"]["id"]) != TG_ADMIN_ID:
+        tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="권한이 없습니다")
+        return True
+    action, _, data = (cq.get("data") or "").partition(":")
+    ids = decode_ids(data)
+    print(f"[승인 응답: {action} #{ids[0]}]")
+    if DRY_RUN:
+        return True
+
+    def edit(text, keep_buttons=False):
+        params = dict(chat_id=TG_ADMIN_ID, message_id=btn.get("message_id"), text=text)
+        if keep_buttons:
+            params["reply_markup"] = btn.get("reply_markup")
+        tg_quiet("editMessageText", **params)
+
+    if action == "no":
+        tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="건너뛰었습니다")
+        edit("❌ 건너뛰었습니다")
+        return True
+
+    tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="X에 올리는 중...")
+    try:
+        msgs = fetch_posts(ids)
+        if not msgs:
+            edit("⚠️ 채널에서 원본 공지를 찾을 수 없어 건너뛰었습니다")
+            return True
+        url = mirror(msgs, auth)
+    except Exception as e:
+        # 버튼을 남겨 두어 관리자가 다시 누르면 재시도할 수 있게 한다
+        print(f"  ✗ {e}")
+        edit(f"⚠️ X 게시 실패 — [게시]를 다시 누르면 재시도합니다\n\n{str(e)[:500]}", keep_buttons=True)
+        return False
+    edit(f"✅ X에 게시했습니다\n{url}" if url else "✅ 이미 X에 올라간 내용입니다")
+    return True
+
+
+def handle_dm(msg):
+    text = msg.get("text") or ""
+    if msg["chat"]["type"] == "private" and text.startswith(("/start", "/id")):
+        print(f"[DM /start] user {msg['from']['id']}")
+        if not DRY_RUN:
+            tg_quiet("sendMessage", chat_id=msg["chat"]["id"],
+                     text=f"안녕하세요! 회원님의 텔레그램 ID는\n\n{msg['from']['id']}\n\n"
+                          "입니다. 이 숫자를 GitHub Secrets의 TELEGRAM_ADMIN_ID에 넣으면 "
+                          "새 공지마다 여기로 승인 요청이 옵니다.")
+
+
+# ---------------------------------------------------------------- 메인 루프
+
+def group_items(updates):
+    """업데이트를 처리 단위로 묶는다. 앨범(같은 media_group_id)은 하나의 공지로 묶는다.
+    결과: [(마지막 update_id, 종류, 내용)]"""
+    items, by_group = [], {}
+    for u in updates:
+        uid = u["update_id"]
+        if "callback_query" in u:
+            items.append((uid, "callback", u["callback_query"]))
+        elif "message" in u:
+            items.append((uid, "dm", u["message"]))
+        elif "channel_post" in u and is_target(u["channel_post"]["chat"]):
+            msg = u["channel_post"]
+            gid = msg.get("media_group_id")
+            if gid and gid in by_group:
+                idx = by_group[gid]
+                items[idx] = (uid, "post", items[idx][2] + [msg])
+                continue
+            if gid:
+                by_group[gid] = len(items)
+            items.append((uid, "post", [msg]))
+        else:
+            items.append((uid, "skip", None))
+    return items
+
+
+def process(updates, auth):
+    """처리를 마친 마지막 update_id와 실패 여부를 돌려준다."""
+    items = group_items(updates)
+    # 마지막 공지가 아직 올라가는 중인 앨범일 수 있으면 잠시 미룬다.
+    if items and items[-1][1] == "post" and items[-1][2][-1].get("media_group_id"):
+        if time.time() - items[-1][2][-1]["date"] < ALBUM_SETTLE_SECS:
+            items.pop()
+
+    done_id, failed, answered = None, False, set()
+    for uid, kind, payload in items:
+        if kind == "post" and has_content(payload):
+            if not TG_ADMIN_ID:
+                print(f"[새 공지 #{payload[0]['message_id']}] TELEGRAM_ADMIN_ID가 없어 건너뜀")
+            else:
+                try:
+                    ask_approval(payload)
+                except Exception as e:
+                    print(f"  ✗ 승인 요청 실패: {e}\n"
+                          "    관리자가 봇에게 /start를 보냈는지, TELEGRAM_ADMIN_ID가 맞는지 확인하세요.")
+                    return done_id, True
+        elif kind == "callback":
+            key = (payload.get("message") or {}).get("message_id")
+            if key in answered:  # 같은 버튼을 연달아 누른 경우
+                tg_quiet("answerCallbackQuery", callback_query_id=payload["id"])
+            else:
+                answered.add(key)
+                if not handle_callback(payload, auth):
+                    failed = True
+        elif kind == "dm":
+            handle_dm(payload)
+        done_id = uid
+    return done_id, failed
 
 
 def main():
-    try:
-        updates = tg("getUpdates", timeout=0, limit=100,
-                     allowed_updates=json.dumps(["channel_post", "message"]))
-    except RuntimeError as e:
-        if "webhook" in str(e).lower():
-            sys.exit("이 봇에 webhook이 설정되어 있습니다. deleteWebhook을 먼저 호출하세요.")
-        raise
-    if not updates:
-        print("새 글 없음")
-        return
-
-    posts = group_posts(updates)
-    # 마지막 글이 아직 올라가는 중인 앨범이면 다음 실행으로 미룬다.
-    if posts and posts[-1][1] and posts[-1][1][-1].get("media_group_id"):
-        if time.time() - posts[-1][1][-1]["date"] < ALBUM_SETTLE_SECS:
-            print("방금 올라온 앨범은 다음 실행에서 처리합니다")
-            posts.pop()
-
     auth = None if DRY_RUN else x_auth()
-    done_id, failed = None, False
-    for update_id, msgs in posts:
-        if msgs:
-            print(f"[텔레그램 글 #{msgs[0]['message_id']}]")
-            try:
-                mirror(msgs, auth)
-            except Exception as e:  # 실패한 글부터는 확인하지 않고 다음 실행에서 재시도
-                print(f"  ✗ {e}")
-                failed = True
-                break
-        done_id = update_id
+    deadline = time.time() + RUN_SECS
+    offset, failed, first = None, False, True
+    while True:
+        wait = max(0, min(50, int(deadline - time.time())))
+        if wait == 0 and not first:
+            break
+        first = False
+        params = dict(timeout=wait, limit=100,
+                      allowed_updates=["channel_post", "message", "callback_query"])
+        if offset:
+            params["offset"] = offset  # 이전 업데이트는 처리 완료로 확인된다
+        try:
+            updates = tg("getUpdates", **params)
+        except RuntimeError as e:
+            if "webhook" in str(e).lower():
+                sys.exit("이 봇에 webhook이 설정되어 있습니다. deleteWebhook을 먼저 호출하세요.")
+            raise
+        done_id, err = process(updates, auth) if updates else (None, False)
+        if done_id is not None:
+            offset = done_id + 1
+        if err:
+            failed = True
+            if done_id is None or done_id != updates[-1]["update_id"]:
+                break  # 승인 요청을 못 보낸 공지는 다음 실행 때 다시 시도
+        if time.time() >= deadline:
+            break
+        if updates and done_id != updates[-1]["update_id"]:
+            time.sleep(3)  # 앨범을 기다리는 중
 
-    if done_id is not None and not DRY_RUN:
-        tg("getUpdates", offset=done_id + 1, limit=1, timeout=0)  # 여기까지 처리 완료로 확인
     if DRY_RUN:
-        print("(DRY_RUN: X에 올리지 않았고, 텔레그램에도 처리 완료로 표시하지 않았습니다)")
+        print("(DRY_RUN: 아무것도 보내지 않았고, 텔레그램에도 처리 완료로 표시하지 않았습니다)")
+    elif offset:
+        tg("getUpdates", offset=offset, limit=1, timeout=0)  # 마지막 처리분까지 확인
     if failed:
         sys.exit(1)
 
