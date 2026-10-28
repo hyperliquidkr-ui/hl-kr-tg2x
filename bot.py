@@ -45,6 +45,13 @@ def tg_download(file_id):
     return r.content
 
 
+def is_target(chat):
+    # 숫자 ID(-100...) 또는 공개 채널 아이디(@이름) 둘 다 허용
+    if TG_CHAT_ID.startswith("@"):
+        return (chat.get("username") or "").lower() == TG_CHAT_ID[1:].lower()
+    return str(chat["id"]) == TG_CHAT_ID
+
+
 def post_of(update):
     # 채널은 channel_post, 그룹은 message 로 들어온다. 수정된 글은 무시한다.
     return update.get("channel_post") or update.get("message")
@@ -181,7 +188,7 @@ def group_posts(updates):
     by_group = {}
     for u in updates:
         msg = post_of(u)
-        if not msg or str(msg["chat"]["id"]) != TG_CHAT_ID:
+        if not msg or not is_target(msg["chat"]):
             posts.append((u["update_id"], []))  # 대상이 아닌 업데이트: 확인만 한다
             continue
         gid = msg.get("media_group_id")
