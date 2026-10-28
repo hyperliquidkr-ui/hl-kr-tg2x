@@ -33,5 +33,5 @@ jobs:
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
-          X_MAX_WEIGHT: ${{ vars.X_MAX_WEIGHT }}
+          X_MAX_WEIGHT: ${{ vars.X_MAX_WEIGHT || '25000' }}  # Premium 계정 기준. 일반 계정이면 Variables에 280
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
