@@ -40,7 +40,7 @@
    | 이름 | 값 |
    |---|---|
    | `TELEGRAM_BOT_TOKEN` | 1단계 봇 토큰 |
-   | `TELEGRAM_CHAT_ID` | 1단계 채팅 ID (예: `-1001234567890`) |
+   | `TELEGRAM_CHAT_ID` | 공개 채널이면 `@채널아이디`, 비공개 채널이면 숫자 ID (예: `-1001234567890`) |
    | `X_API_KEY` | API Key |
    | `X_API_SECRET` | API Key Secret |
    | `X_ACCESS_TOKEN` | Access Token |
