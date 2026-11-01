@@ -271,13 +271,61 @@ def fetch_posts(ids):
     return msgs
 
 
+# 봇이 직접 공지방에 올린 글. 혹시 channel_post로 다시 들어와도 승인 요청을 두 번 보내지 않게 한다.
+PUBLISHED = set()
+
+
+def handle_publish(cq, action, ids):
+    """트렌드 리포트 초안의 [공지방에 게시]/[건너뛰기] 버튼."""
+    btn = cq.get("message") or {}
+
+    def set_buttons(row):
+        tg_quiet("editMessageReplyMarkup", chat_id=TG_ADMIN_ID, message_id=btn.get("message_id"),
+                 reply_markup={"inline_keyboard": [row] if row else []})
+
+    if action == "skip":
+        tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="건너뛰었습니다")
+        set_buttons([{"text": "❌ 건너뜀", "callback_data": "noop"}])
+        return True
+
+    tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="공지방에 올리는 중...")
+    set_buttons(None)  # 버튼이 공지방 글에 같이 복사되지 않게 먼저 뗀다
+    try:
+        posted = tg("copyMessages", chat_id=TG_CHAT_ID, from_chat_id=TG_ADMIN_ID, message_ids=ids)
+        channel = tg("getChat", chat_id=TG_CHAT_ID)
+    except Exception as e:
+        print(f"  ✗ {e}")
+        tg_quiet("editMessageReplyMarkup", chat_id=TG_ADMIN_ID, message_id=btn.get("message_id"),
+                 reply_markup=btn.get("reply_markup"))
+        tg_quiet("sendMessage", chat_id=TG_ADMIN_ID,
+                 text=f"⚠️ 공지방 게시 실패 — 버튼을 다시 누르면 재시도합니다\n\n{str(e)[:500]}\n\n"
+                      "봇에게 공지방 '메시지 게시' 권한이 있는지 /status 로 확인해 주세요.")
+        return False
+    PUBLISHED.update(p["message_id"] for p in posted)
+    first = posted[0]["message_id"]
+    if channel.get("username"):
+        set_buttons([{"text": "✅ 공지방에 게시됨 — 보기", "url": f"https://t.me/{channel['username']}/{first}"}])
+    else:
+        set_buttons([{"text": "✅ 공지방에 게시됨", "callback_data": "noop"}])
+    print(f"  ✓ 공지방 게시: #{first}")
+    # 이어서 X 게시 승인 요청
+    ask_approval([{"message_id": p["message_id"], "chat": {"id": channel["id"]}} for p in posted])
+    return True
+
+
 def handle_callback(cq, auth):
     btn = cq.get("message") or {}
     if str(cq["from"]["id"]) != TG_ADMIN_ID:
         tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="권한이 없습니다")
         return True
     action, _, data = (cq.get("data") or "").partition(":")
+    if action == "noop" or not data:
+        tg_quiet("answerCallbackQuery", callback_query_id=cq["id"])
+        return True
     ids = decode_ids(data)
+    if action in ("pub", "skip"):
+        print(f"[공지방 게시 응답: {action}]")
+        return True if DRY_RUN else handle_publish(cq, action, ids)
     print(f"[승인 응답: {action} #{ids[0]}]")
     if DRY_RUN:
         return True
@@ -319,6 +367,10 @@ def status_report():
         member = tg("getChatMember", chat_id=TG_CHAT_ID, user_id=me["id"])
         if member["status"] in ("administrator", "creator"):
             lines.append(f"• 봇(@{me['username']})이 채널 관리자 ✅")
+            if member.get("can_post_messages") is False:
+                lines.append("• 공지방 '메시지 게시' 권한 없음 ❌ → 채널 관리자 설정에서 봇에게 게시 권한을 켜 주세요")
+            else:
+                lines.append("• 공지방 '메시지 게시' 권한 ✅")
         else:
             lines.append(f"• 봇(@{me['username']})이 채널 관리자가 아닙니다 ❌ → 채널 관리자로 추가해 주세요")
     except Exception as e:
@@ -389,7 +441,9 @@ def process(updates, auth):
 
     done_id, failed, answered = None, False, set()
     for uid, kind, payload in items:
-        if kind == "post" and has_content(payload):
+        if kind == "post" and any(m["message_id"] in PUBLISHED for m in payload):
+            pass  # 봇이 방금 직접 올린 글 (승인 요청은 이미 보냄)
+        elif kind == "post" and has_content(payload):
             if not TG_ADMIN_ID:
                 print(f"[새 공지 #{payload[0]['message_id']}] TELEGRAM_ADMIN_ID가 없어 건너뜀")
             else:
