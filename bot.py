@@ -437,8 +437,12 @@ def status_report():
             pinned = tg("getChat", chat_id=TG_ADMIN_ID).get("pinned_message") or {}
             ptext = pinned.get("text") or pinned.get("caption") or ""
             ents = pinned.get("entities") or pinned.get("caption_entities") or []
-            if "Hyperliquid_KR" not in ptext:
-                lines.append("• DM 고정 푸터: 못 찾음 ❌ (Hyperliquid_KR 푸터 메시지를 이 대화에 고정해 주세요)")
+            if not pinned:
+                lines.append("• DM 고정 푸터: 고정된 메시지 없음 ❌\n"
+                             "  → 푸터 메시지를 이 대화에 보내고, 그 메시지에 답장으로 /footer 를 보내 주세요")
+            elif "Hyperliquid_KR" not in ptext:
+                lines.append(f"• DM 고정 푸터: 고정된 메시지가 푸터가 아님 ❌ (\"{ptext[:30]}…\")\n"
+                             "  → 푸터 메시지에 답장으로 /footer 를 보내 주세요")
             else:
                 n = sum(e["type"] == "custom_emoji" for e in ents)
                 lines.append(f"• DM 고정 푸터: 찾음 ✅ (커스텀 이모지 {n}개, 링크 "
@@ -451,11 +455,38 @@ def status_report():
     return "\n".join(lines)
 
 
+def set_footer(msg):
+    """/footer 를 답장으로 보낸 메시지를 봇이 직접 고정한다. 트렌드 초안의 푸터로 쓰인다."""
+    target = msg.get("reply_to_message")
+    chat = msg["chat"]["id"]
+    if not target:
+        tg_quiet("sendMessage", chat_id=chat,
+                 text="푸터로 쓸 메시지를 길게 눌러 '답장'을 고른 뒤 /footer 를 보내 주세요.")
+        return
+    ftext = target.get("text") or target.get("caption") or ""
+    ents = target.get("entities") or target.get("caption_entities") or []
+    try:
+        tg("pinChatMessage", chat_id=chat, message_id=target["message_id"], disable_notification=True)
+    except Exception as e:
+        tg_quiet("sendMessage", chat_id=chat, text=f"⚠️ 고정 실패: {e}")
+        return
+    n = sum(e["type"] == "custom_emoji" for e in ents)
+    warn = "" if "Hyperliquid_KR" in ftext else "\n⚠️ 메시지에 'Hyperliquid_KR'이 없어 푸터로 인식되지 않습니다."
+    tg_quiet("sendMessage", chat_id=chat, reply_to_message_id=target["message_id"],
+             text=f"📌 이 메시지를 푸터로 고정했습니다 (커스텀 이모지 {n}개, 링크 "
+                  f"{sum(e['type'] == 'text_link' for e in ents)}개).\n다음 트렌드 리포트부터 이 푸터가 붙습니다.{warn}")
+
+
 def handle_dm(msg):
     text = msg.get("text") or ""
-    if msg["chat"]["type"] != "private" or not text.startswith(("/start", "/id", "/status")):
+    if msg["chat"]["type"] != "private" or not text.startswith(("/start", "/id", "/status", "/footer")):
         return
     uid = str(msg["from"]["id"])
+    if text.startswith("/footer"):
+        print(f"[DM /footer] user {uid}")
+        if not DRY_RUN and TG_ADMIN_ID and uid == TG_ADMIN_ID:
+            set_footer(msg)
+        return
     print(f"[DM {text.split()[0]}] user {uid}")
     if DRY_RUN:
         return
