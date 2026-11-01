@@ -133,12 +133,14 @@ def x_upload_image(content, auth):
     return r.json()["data"]["id"]
 
 
-def x_tweet(text, auth, media_ids=None, reply_to=None):
+def x_tweet(text, auth, media_ids=None, reply_to=None, quote_id=None):
     body = {"text": text}
     if media_ids:
         body["media"] = {"media_ids": media_ids}
     if reply_to:
         body["reply"] = {"in_reply_to_tweet_id": reply_to}
+    if quote_id:
+        body["quote_tweet_id"] = quote_id
     r = requests.post(f"{X_API}/tweets", auth=auth, json=body, timeout=30)
     if r.status_code == 403 and "duplicate" in r.text.lower():
         raise DuplicateTweet(r.text)
@@ -207,33 +209,77 @@ def split_text(text, limit, seps=("\n\n", "\n", " ")):
 
 # ---------------------------------------------------------------- X 게시
 
+# 공지 끝의 원문 X 링크. X에는 링크 대신 원문 인용으로 올린다 (링크가 들어간 글은 X 요금이 훨씬 비쌈).
+X_STATUS_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/\w+/status/(\d+)\S*")
+
+
+def split_quote(text):
+    """마지막 원문 X 링크를 본문에서 빼고 (본문, 인용할 글 번호)를 돌려준다. 없으면 (본문, None)."""
+    links = list(X_STATUS_RE.finditer(text))
+    if not links:
+        return text, None
+    m = links[-1]
+    rest = (text[:m.start()] + text[m.end():]).strip()
+    return re.sub(r"\n{3,}", "\n\n", rest), m.group(1)
+
+
 def mirror(msgs, auth):
-    """공지를 X에 올리고 첫 트윗 주소를 돌려준다. 이미 올라간 내용이면 None."""
-    text = "\n".join(t for t in (strip_footer(post_text(m)) for m in msgs) if t)
+    """공지를 X에 올리고 (첫 트윗 주소, 방식)을 돌려준다. 이미 올라간 내용이면 (None, None)."""
+    full = "\n".join(t for t in (strip_footer(post_text(m)) for m in msgs) if t)
+    text, quote_id = split_quote(full)
     photos = [m["photo"][-1]["file_id"] for m in msgs if m.get("photo")][:4]
     skipped = [k for m in msgs for k in ("video", "animation", "document", "poll") if k in m]
     if skipped:
         print(f"  ! 지원하지 않는 첨부({', '.join(skipped)})는 빼고 올립니다")
-    chunks = split_text(text, MAX_WEIGHT) or [""]
+    chunks = split_text(text if quote_id else full, MAX_WEIGHT) or [""]
 
-    print(f"  트윗 {len(chunks)}개, 사진 {len(photos)}장")
+    print(f"  트윗 {len(chunks)}개, 사진 {len(photos)}장, 인용: {quote_id or '없음'}")
     for i, c in enumerate(chunks):
         print(f"  --- [{i + 1}] (weight {weight(c)}/{MAX_WEIGHT})\n{c}")
     if DRY_RUN:
-        return None
+        return None, None
 
     media_ids = [x_upload_image(tg_download(f), auth) for f in photos]
+    if quote_id:
+        try:
+            first = post_thread(chunks, auth, media_ids, quote_id)
+            mode = "원문 인용"
+        except QuoteFailed as e:
+            # 인용 게시가 막혀 있으면 원래대로 원문 링크를 넣어 올린다
+            print(f"  ! 인용 게시 실패, 링크 포함으로 다시 올립니다: {e}")
+            first = post_thread(split_text(full, MAX_WEIGHT) or [""], auth, media_ids)
+            mode = "링크 포함 — 인용 게시가 거부됨"
+    else:
+        first = post_thread(chunks, auth, media_ids)
+        mode = "일반"
+    return (f"https://x.com/i/status/{first}", mode) if first else (None, None)
+
+
+class QuoteFailed(Exception):
+    pass
+
+
+def post_thread(chunks, auth, media_ids, quote_id=None):
+    """나눠진 글을 스레드로 올리고 첫 트윗 번호를 돌려준다. 이미 올라간 내용이면 None."""
     first = reply_to = None
     for i, chunk in enumerate(chunks):
         try:
-            reply_to = x_tweet(chunk, auth, media_ids if i == 0 else None, reply_to)
+            if i == 0 and quote_id:
+                try:
+                    reply_to = x_tweet(chunk, auth, media_ids, quote_id=quote_id)
+                except DuplicateTweet:
+                    raise
+                except RuntimeError as e:
+                    raise QuoteFailed(e)
+            else:
+                reply_to = x_tweet(chunk, auth, media_ids if i == 0 else None, reply_to)
             first = first or reply_to
             print(f"  ✓ 게시됨: https://x.com/i/status/{reply_to}")
         except DuplicateTweet:
             print("  - 이미 올라간 내용이라 건너뜁니다")
             if i == 0:
                 return None
-    return f"https://x.com/i/status/{first}"
+    return first
 
 
 # ---------------------------------------------------------------- 승인 흐름
@@ -357,13 +403,13 @@ def handle_callback(cq, auth):
         if not msgs:
             edit("⚠️ 채널에서 원본 공지를 찾을 수 없어 건너뛰었습니다")
             return True
-        url = mirror(msgs, auth)
+        url, mode = mirror(msgs, auth)
     except Exception as e:
         # 버튼을 남겨 두어 관리자가 다시 누르면 재시도할 수 있게 한다
         print(f"  ✗ {e}")
         edit(f"⚠️ X 게시 실패 — [게시]를 다시 누르면 재시도합니다\n\n{str(e)[:500]}", keep_buttons=True)
         return False
-    edit(f"✅ X에 게시했습니다\n{url}" if url else "✅ 이미 X에 올라간 내용입니다")
+    edit(f"✅ X에 게시했습니다 ({mode})\n{url}" if url else "✅ 이미 X에 올라간 내용입니다")
     return True
 
 
