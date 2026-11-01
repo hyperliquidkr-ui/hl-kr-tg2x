@@ -22,7 +22,8 @@ DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 # 한 번에 가져올 글 수 (10~100). 글 1개마다 X 읽기 요금이 붙는다.
 FETCH_COUNT = int(os.environ.get("TRENDS_FETCH_COUNT") or 50)
 WINDOW_HOURS = int(os.environ.get("TRENDS_WINDOW_HOURS") or 8)
-QUERY = os.environ.get("TRENDS_QUERY") or "(Hyperliquid OR HyperEVM OR HyperCore) -is:retweet -is:reply"
+QUERY = os.environ.get("TRENDS_QUERY") or (
+    "(Hyperliquid OR HyperEVM OR HyperCore OR $HYPE OR \"HIP-3\" OR HIP3) -is:retweet -is:reply")
 TOP_N = 5
 CANDIDATES = 15  # Claude에게 넘길 후보 수 (스팸 걸러내고 Top 5 고르기용)
 
