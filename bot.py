@@ -301,8 +301,12 @@ def ask_approval(msgs):
     print(f"[새 공지 #{ids[0]}] 관리자에게 승인 요청")
     if DRY_RUN:
         return
-    tg("forwardMessages", chat_id=TG_ADMIN_ID, from_chat_id=msgs[0]["chat"]["id"], message_ids=ids)
+    fwd = tg("forwardMessages", chat_id=TG_ADMIN_ID, from_chat_id=msgs[0]["chat"]["id"], message_ids=ids)
     data = encode_ids(ids)
+    # 버튼을 누르면 DM에서 지울 수 있게, 전달된 메시지 위치(첫 번호+개수)도 버튼에 담는다
+    dm = f";{fwd[0]['message_id']}+{len(fwd)}" if fwd else ""
+    if len(f"ok:{data}{dm}") <= 64:
+        data += dm
     tg("sendMessage", chat_id=TG_ADMIN_ID,
        text="⬆️ 위 공지를 X(트위터)에 올릴까요?",
        reply_markup={"inline_keyboard": [[
@@ -331,26 +335,38 @@ def fetch_posts(ids):
 PUBLISHED = set()
 
 
+def delete_dm(ids):
+    """처리가 끝난 메시지를 DM에서 지워 대화방을 깔끔하게 유지한다."""
+    ids = sorted({i for i in ids if i})
+    if ids:
+        tg_quiet("deleteMessages", chat_id=TG_ADMIN_ID, message_ids=ids)
+
+
+def toast(cq, text):
+    tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text=text)
+
+
 def handle_publish(cq, action, ids):
     """트렌드 리포트 초안의 [공지방에 게시]/[건너뛰기] 버튼."""
     btn = cq.get("message") or {}
+    preview = ids + [btn.get("message_id")]
 
     def set_buttons(row):
         tg_quiet("editMessageReplyMarkup", chat_id=TG_ADMIN_ID, message_id=btn.get("message_id"),
                  reply_markup={"inline_keyboard": [row] if row else []})
 
     if action == "skip":
-        tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="건너뛰었습니다")
-        set_buttons([{"text": "❌ 건너뜀", "callback_data": "noop"}])
+        toast(cq, "건너뛰었습니다")
+        delete_dm(preview)
         return True
 
-    tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="공지방에 올리는 중...")
     set_buttons(None)  # 버튼이 공지방 글에 같이 복사되지 않게 먼저 뗀다
     try:
         posted = tg("copyMessages", chat_id=TG_CHAT_ID, from_chat_id=TG_ADMIN_ID, message_ids=ids)
         channel = tg("getChat", chat_id=TG_CHAT_ID)
     except Exception as e:
         print(f"  ✗ {e}")
+        toast(cq, "⚠️ 공지방 게시 실패")
         tg_quiet("editMessageReplyMarkup", chat_id=TG_ADMIN_ID, message_id=btn.get("message_id"),
                  reply_markup=btn.get("reply_markup"))
         tg_quiet("sendMessage", chat_id=TG_ADMIN_ID,
@@ -359,10 +375,8 @@ def handle_publish(cq, action, ids):
         return False
     PUBLISHED.update(p["message_id"] for p in posted)
     first = posted[0]["message_id"]
-    if channel.get("username"):
-        set_buttons([{"text": "✅ 공지방에 게시됨 — 보기", "url": f"https://t.me/{channel['username']}/{first}"}])
-    else:
-        set_buttons([{"text": "✅ 공지방에 게시됨", "callback_data": "noop"}])
+    toast(cq, "✅ 공지방에 게시했습니다")
+    delete_dm(preview)
     print(f"  ✓ 공지방 게시: #{first}")
     # 이어서 X 게시 승인 요청
     ask_approval([{"message_id": p["message_id"], "chat": {"id": channel["id"]}} for p in posted])
@@ -378,6 +392,7 @@ def handle_callback(cq, auth):
     if action == "noop" or not data:
         tg_quiet("answerCallbackQuery", callback_query_id=cq["id"])
         return True
+    data, _, dm = data.partition(";")
     ids = decode_ids(data)
     if action in ("pub", "skip"):
         print(f"[공지방 게시 응답: {action}]")
@@ -386,30 +401,33 @@ def handle_callback(cq, auth):
     if DRY_RUN:
         return True
 
-    def edit(text, keep_buttons=False):
-        params = dict(chat_id=TG_ADMIN_ID, message_id=btn.get("message_id"), text=text)
-        if keep_buttons:
-            params["reply_markup"] = btn.get("reply_markup")
-        tg_quiet("editMessageText", **params)
+    # 승인 요청 메시지 + 그 위에 전달된 공지 (처리 후 DM에서 지운다)
+    first, _, count = dm.partition("+")
+    request = [btn.get("message_id")] + (
+        list(range(int(first), int(first) + int(count))) if first.isdigit() and count.isdigit() else [])
 
     if action == "no":
-        tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="건너뛰었습니다")
-        edit("❌ 건너뛰었습니다")
+        toast(cq, "건너뛰었습니다")
+        delete_dm(request)
         return True
 
-    tg_quiet("answerCallbackQuery", callback_query_id=cq["id"], text="X에 올리는 중...")
     try:
         msgs = fetch_posts(ids)
         if not msgs:
-            edit("⚠️ 채널에서 원본 공지를 찾을 수 없어 건너뛰었습니다")
+            toast(cq, "채널에서 원본 공지를 찾을 수 없어 건너뛰었습니다")
+            delete_dm(request)
             return True
         url, mode = mirror(msgs, auth)
     except Exception as e:
-        # 버튼을 남겨 두어 관리자가 다시 누르면 재시도할 수 있게 한다
+        # 메시지와 버튼을 남겨 두어 관리자가 다시 누르면 재시도할 수 있게 한다
         print(f"  ✗ {e}")
-        edit(f"⚠️ X 게시 실패 — [게시]를 다시 누르면 재시도합니다\n\n{str(e)[:500]}", keep_buttons=True)
+        toast(cq, "⚠️ X 게시 실패")
+        tg_quiet("editMessageText", chat_id=TG_ADMIN_ID, message_id=btn.get("message_id"),
+                 text=f"⚠️ X 게시 실패 — [게시]를 다시 누르면 재시도합니다\n\n{str(e)[:500]}",
+                 reply_markup=btn.get("reply_markup"))
         return False
-    edit(f"✅ X에 게시했습니다 ({mode})\n{url}" if url else "✅ 이미 X에 올라간 내용입니다")
+    toast(cq, f"✅ X에 게시했습니다 ({mode})" if url else "이미 X에 올라간 내용입니다")
+    delete_dm(request)
     return True
 
 
