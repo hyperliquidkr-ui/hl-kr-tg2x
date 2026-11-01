@@ -335,18 +335,13 @@ def send_draft(draft, p, footer):
 
 # ---------------------------------------------------------------- 메인
 
-def fmt_num(n):
-    return f"{n / 1000:.1f}K" if n >= 1000 else str(n)
-
-
 def main():
     now = datetime.now(KST).strftime("%m/%d %H시")
     try:
         posts = fetch_posts()
         print(f"X에서 {len(posts)}개 가져옴")
         if not posts:
-            tg_send(f"🔥 Hyperliquid 트렌드 ({now})\n\n지난 {WINDOW_HOURS}시간 동안 새 화제글이 없습니다.")
-            return
+            return  # 새 화제글이 없으면 아무것도 보내지 않는다
         candidates = sorted(posts, key=score, reverse=True)[:CANDIDATES]
         selected = select(candidates)
         drafts = write_drafts([p for _, p in selected]) if selected else {}
@@ -354,31 +349,17 @@ def main():
         tg_send(f"⚠️ Hyperliquid 트렌드 리포트 실패 ({now})\n\n{str(e)[:800]}")
         raise
 
-    picked = [({"summary_ko": summary, "draft": drafts.get(i)}, p) for i, (summary, p) in enumerate(selected)]
-    lines = [f"🔥 Hyperliquid 트렌드 Top {len(picked)} ({now}, 지난 {WINDOW_HOURS}시간)"]
-    for n, (item, p) in enumerate(picked, 1):
-        media = f" · 📎{p['media']}" if p["media"] else ""
-        lines.append(
-            f"{n}. {item['summary_ko']}\n"
-            f"   ❤️ {fmt_num(p['likes'])} · 🔁 {fmt_num(p['reposts'])} · 👁 {fmt_num(p['views'])}{media} — @{p['author']}\n"
-            f"   {p['url']}"
-        )
-    if not picked:
-        lines.append("공지할 만한 소식이 없었습니다.")
-    else:
-        lines.append("📝 아래로 소식별 공지 초안이 원문 사진·영상과 함께 이어집니다.\n"
-                     "[📤 공지방에 게시]를 누르면 보이는 그대로 공지방에 올라가고, 이어서 X 게시 여부를 묻습니다.\n"
-                     "고쳐서 올리고 싶으면 복사해서 직접 올리세요.")
-    tg_send("\n\n".join(lines))
+    # 요약 목록 없이 소식별 초안 미리보기만 보낸다
+    picked = [(drafts[i], p) for i, (summary, p) in enumerate(selected) if drafts.get(i)]
+    for summary, p in selected:
+        print(f"  - {summary} ({p['url']})")
     footer = load_footer() if picked else None
-    for item, p in picked:
-        if not item["draft"]:
-            continue
+    for draft, p in picked:
         try:
-            send_draft(item["draft"], p, footer)
+            send_draft(draft, p, footer)
         except Exception as e:
             print(f"  ✗ 초안 전송 실패: {e}")
-            tg_send(f"⚠️ 초안 전송 실패: {str(e)[:300]}\n\n{item['draft']}")
+            tg_send(f"⚠️ 초안 전송 실패: {str(e)[:300]}\n\n{draft}")
 
 
 if __name__ == "__main__":
