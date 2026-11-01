@@ -432,6 +432,19 @@ def status_report():
     except Exception as e:
         lines.append(f"• 채널 확인 실패 ❌ ({e})\n  → 봇이 채널 관리자인지, TELEGRAM_CHAT_ID가 맞는지 확인해 주세요")
     lines.append(f"• 관리자 ID: {TG_ADMIN_ID or '(비어 있음) ❌'}")
+    if TG_ADMIN_ID:
+        try:
+            pinned = tg("getChat", chat_id=TG_ADMIN_ID).get("pinned_message") or {}
+            ptext = pinned.get("text") or pinned.get("caption") or ""
+            ents = pinned.get("entities") or pinned.get("caption_entities") or []
+            if "Hyperliquid_KR" not in ptext:
+                lines.append("• DM 고정 푸터: 못 찾음 ❌ (Hyperliquid_KR 푸터 메시지를 이 대화에 고정해 주세요)")
+            else:
+                n = sum(e["type"] == "custom_emoji" for e in ents)
+                lines.append(f"• DM 고정 푸터: 찾음 ✅ (커스텀 이모지 {n}개, 링크 "
+                             f"{sum(e['type'] == 'text_link' for e in ents)}개)")
+        except Exception as e:
+            lines.append(f"• DM 고정 푸터: 확인 실패 ({e})")
     x_keys = ["X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET"]
     missing = [k for k in x_keys if not os.environ.get(k)]
     lines.append("• X 키 4개 ✅" if not missing else f"• X 키 없음 ❌: {', '.join(missing)}")
