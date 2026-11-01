@@ -31,21 +31,25 @@ def capture():
     """(24h Fees 달러 금액, 카드 캡처 파일 경로)를 돌려준다."""
     with sync_playwright() as p:
         browser = p.chromium.launch(executable_path=os.environ.get("CHROMIUM_PATH"))  # 기본: playwright가 설치한 브라우저
-        page = browser.new_page(viewport={"width": 1440, "height": 1000}, device_scale_factor=2,
+        # 휴대폰 폭으로 열면 카드가 가로로 꽉 차서 평소 올리던 캡처와 같은 모양이 된다
+        page = browser.new_page(viewport={"width": 460, "height": 900}, device_scale_factor=3,
                                 color_scheme="dark", locale="ko-KR", timezone_id="Asia/Seoul")
         page.goto(PAGE_URL, wait_until="networkidle", timeout=90_000)
         label = page.get_by_text("24h Fees", exact=True).first
         label.wait_for(timeout=60_000)
         page.wait_for_timeout(4000)  # 차트 애니메이션이 끝날 때까지
 
-        # '24h Fees' 글자에서 위로 올라가며, 금액과 차트를 함께 담은 카드 영역을 찾는다
-        card = label
+        # '24h Fees' 글자에서 위로 올라가며, 금액과 차트를 함께 담은 가장 작은 영역(카드)을 찾는다
+        card, found = label, False
         for _ in range(8):
-            parent = card.locator("xpath=..")
-            box = parent.bounding_box()
-            card = parent
-            if box and box["width"] >= 350 and box["height"] >= 180 and re.search(r"\d[\d,]{3,}\s*\$", parent.inner_text()):
+            card = card.locator("xpath=..")
+            box = card.bounding_box() or {}
+            if (150 <= box.get("height", 0) <= 500 and card.locator("canvas, svg").count()
+                    and re.search(r"\d[\d,]{3,}\s*\$", card.inner_text())):
+                found = True
                 break
+        if not found:
+            raise RuntimeError("대시보드에서 24h Fees 카드를 찾지 못했습니다 (사이트 구조가 바뀌었을 수 있음)")
         text = card.inner_text()
         if DEBUG_DIR:
             Path(DEBUG_DIR).mkdir(parents=True, exist_ok=True)
