@@ -1,0 +1,38 @@
+name: Hyperliquid trends report
+
+on:
+  schedule:
+    - cron: "0 0,8,16 * * *"  # 한국 시간 오전 9시, 오후 5시, 새벽 1시 (GitHub 사정으로 늦어질 수 있음)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "테스트 모드 (X 검색·요약은 하지만 DM은 보내지 않고 로그로만 확인)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: trends
+  cancel-in-progress: false
+
+jobs:
+  trends:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python trends.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TRENDS_FETCH_COUNT: ${{ vars.TRENDS_FETCH_COUNT || '50' }}  # 한 번에 가져올 X 글 수 (비용 = 글 수 × 약 7원)
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
