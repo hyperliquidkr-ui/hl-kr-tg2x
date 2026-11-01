@@ -1,0 +1,47 @@
+name: Daily scorecard
+
+on:
+  schedule:
+    - cron: "30 13 * * *"  # 한국 시간 오후 10시 30분 (GitHub 사정으로 늦어질 수 있음)
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "캡처 점검용 파일(전체 화면, 카드 글자)을 debug-scorecard 브랜치에 올리기"
+        type: boolean
+        default: false
+
+concurrency:
+  group: scorecard
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # 점검용 브랜치에 올릴 때만 쓴다
+
+jobs:
+  scorecard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt playwright==1.48.0
+      - run: python -m playwright install --with-deps chromium
+      - run: python scorecard.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
+          SCORECARD_DEBUG_DIR: ${{ inputs.debug && 'debug' || '' }}
+      - name: Upload debug files to debug-scorecard branch
+        if: ${{ always() && inputs.debug }}
+        run: |
+          mkdir -p debug && cp -f scorecard.png debug/ 2>/dev/null || true
+          git config user.name "scorecard-bot"
+          git config user.email "scorecard-bot@users.noreply.github.com"
+          git checkout --orphan debug-scorecard
+          git rm -rq --cached .
+          git add -f debug
+          git commit -qm "scorecard debug $(date -u +%FT%TZ)"
+          git push -f origin debug-scorecard
