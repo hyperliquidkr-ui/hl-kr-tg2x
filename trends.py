@@ -75,27 +75,28 @@ def tg_send(text, html_mode=False):
 
 # ---------------------------------------------------------------- X 검색
 
-def fetch_posts():
-    start = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
-    r = requests.get(
-        "https://api.x.com/2/tweets/search/recent",
-        auth=OAuth1(os.environ["X_API_KEY"], os.environ["X_API_SECRET"],
-                    os.environ["X_ACCESS_TOKEN"], os.environ["X_ACCESS_TOKEN_SECRET"]),
-        params={
-            "query": QUERY,
-            "max_results": max(10, min(100, FETCH_COUNT)),
-            "sort_order": "relevancy",
-            "start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "tweet.fields": "public_metrics,created_at,lang,author_id,attachments",
-            "expansions": "author_id,attachments.media_keys",
-            "user.fields": "username,name,verified,public_metrics",
-            "media.fields": "type,url,variants",
-        },
-        timeout=30,
-    )
+def x_auth():
+    return OAuth1(os.environ["X_API_KEY"], os.environ["X_API_SECRET"],
+                  os.environ["X_ACCESS_TOKEN"], os.environ["X_ACCESS_TOKEN_SECRET"])
+
+
+def x_get(path, params):
+    r = requests.get(f"https://api.x.com/2/{path}", auth=x_auth(), params=params, timeout=30)
     if r.status_code >= 300:
-        raise RuntimeError(f"X 검색 실패 ({r.status_code}): {r.text[:500]}")
-    data = r.json()
+        raise RuntimeError(f"X 조회 실패 ({r.status_code}): {r.text[:500]}")
+    return r.json()
+
+
+TWEET_PARAMS = {
+    # note_tweet: Premium 계정의 긴 글 전문 (없으면 text는 앞부분만 잘려 옴)
+    "tweet.fields": "public_metrics,created_at,lang,author_id,attachments,note_tweet,referenced_tweets",
+    "expansions": "author_id,attachments.media_keys",
+    "user.fields": "username,name,verified,public_metrics",
+    "media.fields": "type,url,variants,preview_image_url",
+}
+
+
+def parse_tweets(data):
     users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
     media = {m["media_key"]: m for m in data.get("includes", {}).get("media", [])}
     posts = []
@@ -109,9 +110,10 @@ def fetch_posts():
         video_urls = sorted((v for m in videos[:1] for v in m.get("variants", [])
                              if v.get("content_type") == "video/mp4"),
                             key=lambda v: v.get("bit_rate", 0), reverse=True)
+        quoted = [r["id"] for r in t.get("referenced_tweets", []) if r["type"] == "quoted"]
         posts.append({
             "id": t["id"],
-            "text": t["text"],
+            "text": (t.get("note_tweet") or {}).get("text") or t["text"],
             "author": u.get("username", "?"),
             "followers": u.get("public_metrics", {}).get("followers_count", 0),
             "likes": m.get("like_count", 0),
@@ -120,76 +122,121 @@ def fetch_posts():
             "views": m.get("impression_count", 0),
             "media": "동영상" if videos else "사진" if photos else "",
             "photos": photos[:4],
+            # Claude가 읽을 이미지: 사진, 없으면 영상 썸네일
+            "images": photos[:4] or [m["preview_image_url"] for m in videos if m.get("preview_image_url")][:1],
             "video_urls": [v["url"] for v in video_urls],
+            "quoted_id": quoted[0] if quoted else None,
             "url": f"https://x.com/{u.get('username', 'i')}/status/{t['id']}",
         })
     return posts
+
+
+def fetch_posts():
+    start = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
+    return parse_tweets(x_get("tweets/search/recent", {
+        "query": QUERY,
+        "max_results": max(10, min(100, FETCH_COUNT)),
+        "sort_order": "relevancy",
+        "start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        **TWEET_PARAMS,
+    }))
+
+
+def fetch_quoted(posts):
+    """고른 글이 인용한 원문을 가져온다 (최대 TOP_N개라 읽기 요금도 그만큼만)."""
+    ids = [p["quoted_id"] for p in posts if p["quoted_id"]]
+    if not ids:
+        return {}
+    try:
+        return {q["id"]: q for q in parse_tweets(x_get("tweets", {"ids": ",".join(ids), **TWEET_PARAMS}))}
+    except RuntimeError as e:
+        print(f"  인용 원문 가져오기 실패 (원문 없이 진행): {e}")
+        return {}
 
 
 def score(p):
     return p["likes"] + 3 * p["reposts"] + p["replies"] + p["views"] / 1000
 
 
-# ---------------------------------------------------------------- Claude 요약·초안
+# ---------------------------------------------------------------- Claude: 고르기 → 초안 쓰기
 
-SYSTEM = f"""당신은 Hyperliquid 한국 커뮤니티 텔레그램 공지 채널 'Hyperliquid_한국지부 공지방'의 에디터를 돕습니다.
-X에서 모은 Hyperliquid 관련 글 후보를 받아:
-1. 스팸, 에어드랍 사기성 홍보, 단순 가격 자랑, 의미 없는 글을 제외하고
-   한국 커뮤니티가 알아야 할 소식(제품·업데이트, 상장, 생태계 프로젝트, 주요 지표, 업계 이슈) 위주로 최대 {TOP_N}개를 고릅니다.
-   같은 소식을 다룬 글이 여러 개면 가장 원본에 가까운 글 하나만 고릅니다.
-2. 각 글을 한국어 1~2문장으로 요약합니다 (summary_ko, 에디터가 훑어보기용).
-3. 각 글마다 아래 스타일 가이드를 그대로 따른 공지 초안을 씁니다 (draft).
-   제목 → 본문 → 레퍼런스 링크(해당 원문 URL) 순서이며, 푸터는 쓰지 않습니다 (자동으로 붙음).
-   원문에 없는 사실은 추가하지 말고, 확인되지 않은 주장은 그렇다고 밝힙니다.
-쓸 만한 소식이 없으면 items를 비웁니다.
+SELECT_SYSTEM = f"""당신은 Hyperliquid 한국 커뮤니티 텔레그램 공지 채널 'Hyperliquid_한국지부 공지방'의 에디터를 돕습니다.
+X에서 모은 Hyperliquid 관련 글 후보 중에서
+스팸, 에어드랍 사기성 홍보, 단순 가격 자랑, 의미 없는 글을 제외하고
+한국 커뮤니티가 알아야 할 소식(제품·업데이트, 상장, 생태계 프로젝트, 주요 지표, 업계 이슈) 위주로 최대 {TOP_N}개를 고릅니다.
+같은 소식을 다룬 글이 여러 개면 가장 원본에 가까운 글 하나만 고릅니다.
+각 글을 한국어 1~2문장으로 요약합니다 (summary_ko, 에디터가 훑어보기용).
+쓸 만한 소식이 없으면 items를 비웁니다."""
+
+DRAFT_SYSTEM = f"""당신은 Hyperliquid 한국 커뮤니티 텔레그램 공지 채널 'Hyperliquid_한국지부 공지방'의 에디터입니다.
+각 X 글(본문, 첨부 이미지, 인용한 원문 포함)을 읽고 아래 스타일 가이드를 그대로 따른 공지 초안을 씁니다.
+- 제목 → 본문 → 레퍼런스 링크(해당 글의 URL) 순서이며, 푸터는 쓰지 않습니다 (자동으로 붙음).
+- 이미지 속 글자·표·차트 내용과 인용 원문까지 읽고, 핵심 내용을 빠짐없이 축약해서 본문에 담습니다.
+- 원문에 없는 사실은 추가하지 말고, 확인되지 않은 주장은 그렇다고 밝힙니다.
 
 <style_guide>
 {STYLE}
 </style_guide>"""
 
-SCHEMA = {
-    "type": "object",
-    "properties": {
-        "items": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "index": {"type": "integer", "description": "후보 번호"},
-                    "summary_ko": {"type": "string"},
-                    "draft": {"type": "string"},
-                },
-                "required": ["index", "summary_ko", "draft"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["items"],
-    "additionalProperties": False,
-}
+
+def schema(fields):
+    return {
+        "type": "object",
+        "properties": {"items": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"index": {"type": "integer", "description": "글 번호"},
+                           **{f: {"type": "string"} for f in fields}},
+            "required": ["index", *fields],
+            "additionalProperties": False,
+        }}},
+        "required": ["items"],
+        "additionalProperties": False,
+    }
 
 
-def summarize(candidates):
+def ask_claude(system, content, fields):
+    response = anthropic.Anthropic().beta.messages.create(
+        model="claude-opus-5-5",
+        max_tokens=16000,
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",  # 안전 필터로 거절되면 다른 모델로 자동 재시도
+        output_config={"effort": "medium", "format": {"type": "json_schema", "schema": schema(fields)}},
+        system=system,
+        messages=[{"role": "user", "content": content}],
+    )
+    if response.stop_reason == "refusal":
+        raise RuntimeError("Claude가 요청을 거절했습니다")
+    return json.loads(next(b.text for b in response.content if b.type == "text"))["items"]
+
+
+def select(candidates):
+    """1단계: 글 텍스트만 보고 Top N을 고른다 (이미지를 안 넣어 저렴)."""
     listing = "\n\n".join(
         f"[{i}] @{p['author']} (팔로워 {p['followers']:,}) "
         f"❤️{p['likes']} 🔁{p['reposts']} 💬{p['replies']} 👁{p['views']}"
         f"{' [' + p['media'] + ' 첨부]' if p['media'] else ''}\n{p['url']}\n{p['text']}"
         for i, p in enumerate(candidates)
     )
-    client = anthropic.Anthropic()
-    response = client.beta.messages.create(
-        model="claude-opus-5-5",
-        max_tokens=16000,
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",  # 안전 필터로 거절되면 다른 모델로 자동 재시도
-        output_config={"effort": "medium", "format": {"type": "json_schema", "schema": SCHEMA}},
-        system=SYSTEM,
-        messages=[{"role": "user", "content": f"지난 {WINDOW_HOURS}시간 X 후보 글:\n\n{listing}"}],
-    )
-    if response.stop_reason == "refusal":
-        raise RuntimeError("Claude가 요약을 거절했습니다")
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+    items = ask_claude(SELECT_SYSTEM, f"지난 {WINDOW_HOURS}시간 X 후보 글:\n\n{listing}", ["summary_ko"])
+    return [(it["summary_ko"], candidates[it["index"]]) for it in items[:TOP_N]
+            if 0 <= it["index"] < len(candidates)]
+
+
+def write_drafts(posts):
+    """2단계: 고른 글만 이미지·인용 원문까지 보여주고 초안을 쓴다."""
+    quoted = fetch_quoted(posts)
+    content = []
+    for i, p in enumerate(posts):
+        q = quoted.get(p["quoted_id"])
+        block = f"[{i}] @{p['author']} {p['url']}\n{p['text']}"
+        if q:
+            block += f"\n\n(이 글이 인용한 원문 — @{q['author']} {q['url']})\n{q['text']}"
+        content.append({"type": "text", "text": block})
+        for url in (p["images"] + (q["images"] if q else []))[:3]:
+            content.append({"type": "image", "source": {"type": "url", "url": url}})
+    content.append({"type": "text", "text": "위 글마다 공지 초안을 써 주세요."})
+    items = ask_claude(DRAFT_SYSTEM, content, ["draft"])
+    return {it["index"]: it["draft"] for it in items if 0 <= it["index"] < len(posts)}
 
 
 # ---------------------------------------------------------------- 초안 미리보기
@@ -301,13 +348,13 @@ def main():
             tg_send(f"🔥 Hyperliquid 트렌드 ({now})\n\n지난 {WINDOW_HOURS}시간 동안 새 화제글이 없습니다.")
             return
         candidates = sorted(posts, key=score, reverse=True)[:CANDIDATES]
-        result = summarize(candidates)
+        selected = select(candidates)
+        drafts = write_drafts([p for _, p in selected]) if selected else {}
     except Exception as e:
         tg_send(f"⚠️ Hyperliquid 트렌드 리포트 실패 ({now})\n\n{str(e)[:800]}")
         raise
 
-    picked = [(it, candidates[it["index"]]) for it in result["items"][:TOP_N]
-              if 0 <= it["index"] < len(candidates)]
+    picked = [({"summary_ko": summary, "draft": drafts.get(i)}, p) for i, (summary, p) in enumerate(selected)]
     lines = [f"🔥 Hyperliquid 트렌드 Top {len(picked)} ({now}, 지난 {WINDOW_HOURS}시간)"]
     for n, (item, p) in enumerate(picked, 1):
         media = f" · 📎{p['media']}" if p["media"] else ""
@@ -325,6 +372,8 @@ def main():
     tg_send("\n\n".join(lines))
     footer = load_footer() if picked else None
     for item, p in picked:
+        if not item["draft"]:
+            continue
         try:
             send_draft(item["draft"], p, footer)
         except Exception as e:
