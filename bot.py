@@ -91,8 +91,18 @@ def post_text(msg):
     return ""
 
 
+# 공지방 글 끝의 커뮤니티 링크 푸터. X에는 빼고 올린다.
+#   🌧Hyperliquid_KR
+#   공지방 | 채팅방 | X        (숨은 링크가 펼쳐지면 '공지방 (https://t.me/...) | ...')
+FOOTER_RE = re.compile(r"\s*(?:\n[^\n]*Hyperliquid_KR[^\n]*)?\n[^\n]*공지방[^\n]*채팅방[^\n]*\s*$")
+
+
+def strip_footer(text):
+    return FOOTER_RE.sub("", "\n" + text).strip()
+
+
 def has_content(msgs):
-    return any(post_text(m) or m.get("photo") for m in msgs)
+    return any(strip_footer(post_text(m)) or m.get("photo") for m in msgs)
 
 
 # ---------------------------------------------------------------- X
@@ -199,7 +209,7 @@ def split_text(text, limit, seps=("\n\n", "\n", " ")):
 
 def mirror(msgs, auth):
     """공지를 X에 올리고 첫 트윗 주소를 돌려준다. 이미 올라간 내용이면 None."""
-    text = "\n".join(t for t in (post_text(m) for m in msgs) if t)
+    text = "\n".join(t for t in (strip_footer(post_text(m)) for m in msgs) if t)
     photos = [m["photo"][-1]["file_id"] for m in msgs if m.get("photo")][:4]
     skipped = [k for m in msgs for k in ("video", "animation", "document", "poll") if k in m]
     if skipped:
