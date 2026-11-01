@@ -3,14 +3,15 @@
 GitHub Actions에서 8시간마다 실행된다.
 1. X 최근 검색으로 지난 8시간의 Hyperliquid 관련 글을 가져온다 (가져온 글 수만큼 X 요금 발생).
 2. 반응(좋아요·리포스트·조회수)으로 순위를 매겨 상위 후보를 고른다.
-3. Claude가 그중 Top 5를 골라 한국어로 요약하고 텔레그램 공지 초안을 쓴다.
-4. 관리자 DM으로 보낸다. 실제 공지는 관리자가 직접 다듬어 채널에 올린다.
+3. Claude가 그중 Top 5를 골라 한국어로 요약하고, 소식마다 공지방 스타일(STYLE.md)의 초안을 쓴다.
+4. 관리자 DM으로 보낸다: 요약 목록 1개 + 바로 복사해 쓸 수 있는 초안을 소식마다 1개씩.
 """
 
+import html
 import json
 import os
-import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import anthropic
 import requests
@@ -27,10 +28,18 @@ QUERY = os.environ.get("TRENDS_QUERY") or (
 TOP_N = 5
 CANDIDATES = 15  # Claude에게 넘길 후보 수 (스팸 걸러내고 Top 5 고르기용)
 
+STYLE = (Path(__file__).parent / "STYLE.md").read_text(encoding="utf-8")
+FOOTER_HTML = (
+    "🌧Hyperliquid_KR\n"
+    '<a href="https://t.me/Hyperliquid_KR_announce">공지방</a> | '
+    '<a href="https://t.me/Hyperliquid_KR">채팅방</a> | '
+    '<a href="https://x.com/Hyperliquid_KR">X</a>'
+)
+
 KST = timezone(timedelta(hours=9))
 
 
-def tg_send(text):
+def tg_send(text, html_mode=False):
     # 텔레그램 메시지는 4096자 제한이 있어 나눠 보낸다
     chunks, cur = [], ""
     for para in text.split("\n\n"):
@@ -42,10 +51,12 @@ def tg_send(text):
     chunks.append(cur)
     for c in chunks:
         if DRY_RUN:
-            print(c)
+            print(c + "\n" + "-" * 40)
             continue
-        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={
-            "chat_id": TG_ADMIN_ID, "text": c, "disable_web_page_preview": True}, timeout=30)
+        body = {"chat_id": TG_ADMIN_ID, "text": c, "disable_web_page_preview": True}
+        if html_mode:
+            body["parse_mode"] = "HTML"
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json=body, timeout=30)
         if not r.json().get("ok"):
             raise RuntimeError(f"Telegram 전송 실패: {r.text}")
 
@@ -63,9 +74,10 @@ def fetch_posts():
             "max_results": max(10, min(100, FETCH_COUNT)),
             "sort_order": "relevancy",
             "start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "tweet.fields": "public_metrics,created_at,lang,author_id",
-            "expansions": "author_id",
+            "tweet.fields": "public_metrics,created_at,lang,author_id,attachments",
+            "expansions": "author_id,attachments.media_keys",
             "user.fields": "username,name,verified,public_metrics",
+            "media.fields": "type",
         },
         timeout=30,
     )
@@ -73,10 +85,12 @@ def fetch_posts():
         raise RuntimeError(f"X 검색 실패 ({r.status_code}): {r.text[:500]}")
     data = r.json()
     users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
+    media = {m["media_key"]: m["type"] for m in data.get("includes", {}).get("media", [])}
     posts = []
     for t in data.get("data", []):
         u = users.get(t["author_id"], {})
         m = t.get("public_metrics", {})
+        kinds = {media.get(k) for k in t.get("attachments", {}).get("media_keys", [])}
         posts.append({
             "id": t["id"],
             "text": t["text"],
@@ -86,6 +100,7 @@ def fetch_posts():
             "reposts": m.get("retweet_count", 0) + m.get("quote_count", 0),
             "replies": m.get("reply_count", 0),
             "views": m.get("impression_count", 0),
+            "media": "동영상" if kinds & {"video", "animated_gif"} else "사진" if "photo" in kinds else "",
             "url": f"https://x.com/{u.get('username', 'i')}/status/{t['id']}",
         })
     return posts
@@ -95,16 +110,22 @@ def score(p):
     return p["likes"] + 3 * p["reposts"] + p["replies"] + p["views"] / 1000
 
 
-# ---------------------------------------------------------------- Claude 요약
+# ---------------------------------------------------------------- Claude 요약·초안
 
-SYSTEM = """당신은 Hyperliquid 한국 커뮤니티(텔레그램 공지 채널 'Hyperliquid KR')의 에디터를 돕습니다.
+SYSTEM = f"""당신은 Hyperliquid 한국 커뮤니티 텔레그램 공지 채널 'Hyperliquid_한국지부 공지방'의 에디터를 돕습니다.
 X에서 모은 Hyperliquid 관련 글 후보를 받아:
-1. 스팸, 홍보성 에어드랍 사기, 단순 가격 자랑, 의미 없는 글을 제외하고
-   한국 커뮤니티가 알아야 할 소식(제품·업데이트, 상장, 생태계 프로젝트, 주요 지표, 업계 이슈) 위주로 최대 5개를 고릅니다.
-2. 각 글을 한국어 2~3문장으로 요약합니다. 원문에 없는 사실을 추가하지 말고, 확인되지 않은 주장은 '주장'임을 밝힙니다.
-3. 고른 소식을 바탕으로 텔레그램 공지 초안을 하나 씁니다. 친근하지만 공식 채널다운 말투로, 이모지는 절제해서 쓰고,
-   투자 권유로 읽힐 표현은 피합니다. 출처가 필요한 곳에는 원문 링크를 넣습니다.
-쓸 만한 소식이 없으면 items를 비우고 초안에 그 사실을 짧게 씁니다."""
+1. 스팸, 에어드랍 사기성 홍보, 단순 가격 자랑, 의미 없는 글을 제외하고
+   한국 커뮤니티가 알아야 할 소식(제품·업데이트, 상장, 생태계 프로젝트, 주요 지표, 업계 이슈) 위주로 최대 {TOP_N}개를 고릅니다.
+   같은 소식을 다룬 글이 여러 개면 가장 원본에 가까운 글 하나만 고릅니다.
+2. 각 글을 한국어 1~2문장으로 요약합니다 (summary_ko, 에디터가 훑어보기용).
+3. 각 글마다 아래 스타일 가이드를 그대로 따른 공지 초안을 씁니다 (draft).
+   제목 → 본문 → 레퍼런스 링크(해당 원문 URL) 순서이며, 푸터는 쓰지 않습니다 (자동으로 붙음).
+   원문에 없는 사실은 추가하지 말고, 확인되지 않은 주장은 그렇다고 밝힙니다.
+쓸 만한 소식이 없으면 items를 비웁니다.
+
+<style_guide>
+{STYLE}
+</style_guide>"""
 
 SCHEMA = {
     "type": "object",
@@ -116,14 +137,14 @@ SCHEMA = {
                 "properties": {
                     "index": {"type": "integer", "description": "후보 번호"},
                     "summary_ko": {"type": "string"},
+                    "draft": {"type": "string"},
                 },
-                "required": ["index", "summary_ko"],
+                "required": ["index", "summary_ko", "draft"],
                 "additionalProperties": False,
             },
         },
-        "telegram_draft": {"type": "string"},
     },
-    "required": ["items", "telegram_draft"],
+    "required": ["items"],
     "additionalProperties": False,
 }
 
@@ -131,7 +152,8 @@ SCHEMA = {
 def summarize(candidates):
     listing = "\n\n".join(
         f"[{i}] @{p['author']} (팔로워 {p['followers']:,}) "
-        f"❤️{p['likes']} 🔁{p['reposts']} 💬{p['replies']} 👁{p['views']}\n{p['url']}\n{p['text']}"
+        f"❤️{p['likes']} 🔁{p['reposts']} 💬{p['replies']} 👁{p['views']}"
+        f"{' [' + p['media'] + ' 첨부]' if p['media'] else ''}\n{p['url']}\n{p['text']}"
         for i, p in enumerate(candidates)
     )
     client = anthropic.Anthropic()
@@ -170,21 +192,24 @@ def main():
         tg_send(f"⚠️ Hyperliquid 트렌드 리포트 실패 ({now})\n\n{str(e)[:800]}")
         raise
 
-    lines = [f"🔥 Hyperliquid 트렌드 Top {TOP_N} ({now}, 지난 {WINDOW_HOURS}시간)"]
-    for n, item in enumerate(result["items"][:TOP_N], 1):
-        if not 0 <= item["index"] < len(candidates):
-            continue
-        p = candidates[item["index"]]
+    picked = [(it, candidates[it["index"]]) for it in result["items"][:TOP_N]
+              if 0 <= it["index"] < len(candidates)]
+    lines = [f"🔥 Hyperliquid 트렌드 Top {len(picked)} ({now}, 지난 {WINDOW_HOURS}시간)"]
+    for n, (item, p) in enumerate(picked, 1):
+        media = f" · 📎{p['media']}" if p["media"] else ""
         lines.append(
             f"{n}. {item['summary_ko']}\n"
-            f"   ❤️ {fmt_num(p['likes'])} · 🔁 {fmt_num(p['reposts'])} · 👁 {fmt_num(p['views'])} — @{p['author']}\n"
+            f"   ❤️ {fmt_num(p['likes'])} · 🔁 {fmt_num(p['reposts'])} · 👁 {fmt_num(p['views'])}{media} — @{p['author']}\n"
             f"   {p['url']}"
         )
-    if len(lines) == 1:
+    if not picked:
         lines.append("공지할 만한 소식이 없었습니다.")
-    lines.append("📝 텔레그램 공지 초안 (복사해서 다듬어 쓰세요)")
+    else:
+        lines.append("📝 아래로 소식별 공지 초안이 이어집니다. 길게 눌러 복사해서 쓰세요.\n"
+                     "📎 표시가 있으면 원문 사진·영상을 받아 함께 첨부하세요.")
     tg_send("\n\n".join(lines))
-    tg_send(result["telegram_draft"])  # 초안은 따로 보내 길게 눌러 복사하기 쉽게
+    for item, _ in picked:  # 번호 없이 초안만 보내 그대로 복사해 쓸 수 있게 한다
+        tg_send(f"{html.escape(item['draft'].strip())}\n\n{FOOTER_HTML}", html_mode=True)
 
 
 if __name__ == "__main__":
