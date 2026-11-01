@@ -8,7 +8,6 @@ GitHub Actions에서 8시간마다 실행된다.
    미리보기의 [공지방에 게시]를 누르면 bot.py가 그 미리보기를 그대로 공지방에 복사한다.
 """
 
-import html
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -30,12 +29,13 @@ TOP_N = 5
 CANDIDATES = 15  # Claude에게 넘길 후보 수 (스팸 걸러내고 Top 5 고르기용)
 
 STYLE = (Path(__file__).parent / "STYLE.md").read_text(encoding="utf-8")
-FOOTER_HTML = (
-    "🌧Hyperliquid_KR\n"
-    '<a href="https://t.me/Hyperliquid_KR_announce">공지방</a> | '
-    '<a href="https://t.me/Hyperliquid_KR">채팅방</a> | '
-    '<a href="https://x.com/Hyperliquid_KR">X</a>'
-)
+# 푸터는 관리자 DM에 고정된 메시지를 그대로 쓴다. 공지방 푸터의 로고는 커스텀 이모지라
+# 글자로는 재현이 안 되고, 고정 메시지의 서식 정보(entities)를 복사해야 그대로 나온다.
+# 고정 메시지가 없을 때만 아래 기본 푸터를 쓴다.
+DEFAULT_FOOTER = "🌧Hyperliquid_KR\n공지방 | 채팅방 | X"
+DEFAULT_FOOTER_LINKS = [("공지방", "https://t.me/Hyperliquid_KR_announce"),
+                        ("채팅방", "https://t.me/Hyperliquid_KR"),
+                        (" X", "https://x.com/Hyperliquid_KR")]
 
 KST = timezone(timedelta(hours=9))
 
@@ -202,9 +202,41 @@ def publish_buttons(ids):
     ]]}
 
 
+def u16(text):
+    """텔레그램 서식 위치는 UTF-16 단위로 센다."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def load_footer():
+    """관리자 DM에 고정된 푸터 메시지의 (글자, 서식)을 가져온다."""
+    try:
+        pinned = tg("getChat", chat_id=TG_ADMIN_ID).get("pinned_message") or {}
+    except RuntimeError as e:
+        print(f"  고정 메시지 읽기 실패: {e}")
+        pinned = {}
+    text = pinned.get("text") or pinned.get("caption") or ""
+    if "Hyperliquid_KR" in text:
+        return text.strip(), pinned.get("entities") or pinned.get("caption_entities") or []
+    print("  ! DM에 고정된 푸터가 없어 기본 푸터를 씁니다")
+    ents = []
+    for word, url in DEFAULT_FOOTER_LINKS:
+        pos = DEFAULT_FOOTER.rindex(word.strip())
+        ents.append({"type": "text_link", "offset": u16(DEFAULT_FOOTER[:pos]),
+                     "length": u16(word.strip()), "url": url})
+    return DEFAULT_FOOTER, ents
+
+
+def compose(draft, footer):
+    """초안 + 푸터를 하나의 (글자, 서식)으로 합친다. 푸터 서식은 위치만 뒤로 민다."""
+    head = draft.strip() + "\n\n"
+    ftext, fents = footer
+    shift = u16(head)
+    return head + ftext, [dict(e, offset=e["offset"] + shift) for e in fents]
+
+
 def send_media(p, caption=None):
     """원문 사진·영상을 보낸다. 보낸 메시지 번호 목록을 돌려주고, 못 보내면 빈 목록."""
-    cap = {"caption": caption, "parse_mode": "HTML"} if caption else {}
+    cap = {"caption": caption[0], "caption_entities": caption[1]} if caption else {}
     base = {"chat_id": TG_ADMIN_ID}
     if p["video_urls"]:
         for url in p["video_urls"]:
@@ -225,13 +257,12 @@ def send_media(p, caption=None):
     return []
 
 
-def send_draft(draft, p):
+def send_draft(draft, p, footer):
     """초안 미리보기를 보낸다. 공지방에 올라갈 모습 그대로이고, 끝에 게시 버튼이 붙는다."""
-    body = f"{html.escape(draft.strip())}\n\n{FOOTER_HTML}"
-    plain = f"{draft.strip()}\n\n🌧Hyperliquid_KR\n공지방 | 채팅방 | X"
+    body = compose(draft, footer)
     has_media = bool(p["photos"] or p["video_urls"])
     # 텔레그램 사진·영상 설명은 1024자까지라, 짧으면 미디어+설명 한 개로 보낸다
-    if has_media and len(plain.encode("utf-16-le")) // 2 <= 1024:
+    if has_media and u16(body[0]) <= 1024:
         if len(p["photos"]) > 1 and not p["video_urls"]:  # 앨범에는 버튼을 못 붙여 따로 보낸다
             ids = send_media(p, caption=body)
             if ids:
@@ -248,7 +279,7 @@ def send_draft(draft, p):
     ids = send_media(p) if has_media else []
     if has_media and not ids:
         tg_send("⚠️ 원문 사진·영상을 가져오지 못했습니다. 아래 초안을 게시한 뒤 직접 첨부해 주세요.")
-    msg = tg("sendMessage", chat_id=TG_ADMIN_ID, text=body, parse_mode="HTML",
+    msg = tg("sendMessage", chat_id=TG_ADMIN_ID, text=body[0], entities=body[1],
              link_preview_options={"is_disabled": True})
     ids.append(msg["message_id"])
     tg("editMessageReplyMarkup", chat_id=TG_ADMIN_ID, message_id=msg["message_id"],
@@ -292,9 +323,10 @@ def main():
                      "[📤 공지방에 게시]를 누르면 보이는 그대로 공지방에 올라가고, 이어서 X 게시 여부를 묻습니다.\n"
                      "고쳐서 올리고 싶으면 복사해서 직접 올리세요.")
     tg_send("\n\n".join(lines))
+    footer = load_footer() if picked else None
     for item, p in picked:
         try:
-            send_draft(item["draft"], p)
+            send_draft(item["draft"], p, footer)
         except Exception as e:
             print(f"  ✗ 초안 전송 실패: {e}")
             tg_send(f"⚠️ 초안 전송 실패: {str(e)[:300]}\n\n{item['draft']}")
