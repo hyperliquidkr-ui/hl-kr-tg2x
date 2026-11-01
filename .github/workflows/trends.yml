@@ -2,7 +2,7 @@ name: Hyperliquid trends report
 
 on:
   schedule:
-    - cron: "0 0,8,16 * * *"  # 한국 시간 오전 9시, 오후 5시, 새벽 1시 (GitHub 사정으로 늦어질 수 있음)
+    - cron: "0 0,6,12,18 * * *"  # 한국 시간 오전 9시, 오후 3시, 오후 9시, 새벽 3시 (GitHub 사정으로 늦어질 수 있음)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -34,5 +34,6 @@ jobs:
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          TRENDS_FETCH_COUNT: ${{ vars.TRENDS_FETCH_COUNT || '50' }}  # 한 번에 가져올 X 글 수 (비용 = 글 수 × 약 7원)
+          TRENDS_FETCH_COUNT: ${{ vars.TRENDS_FETCH_COUNT || '30' }}  # 한 번에 가져올 X 글 수 (비용 = 글 수 × 약 7원)
+          TRENDS_WINDOW_HOURS: "6"  # cron 간격과 같게 (겹치거나 빠지는 시간 없이)
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}

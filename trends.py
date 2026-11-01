@@ -1,7 +1,7 @@
 """X에서 Hyperliquid 화제글을 모아 관리자 텔레그램 DM으로 트렌드 리포트를 보낸다.
 
-GitHub Actions에서 8시간마다 실행된다.
-1. X 최근 검색으로 지난 8시간의 Hyperliquid 관련 글을 가져온다 (가져온 글 수만큼 X 요금 발생).
+GitHub Actions에서 6시간마다 실행된다.
+1. X 최근 검색으로 지난 6시간의 Hyperliquid 관련 글을 가져온다 (가져온 글 수만큼 X 요금 발생).
 2. 반응(좋아요·리포스트·조회수)으로 순위를 매겨 상위 후보를 고른다.
 3. Claude가 그중 Top 5를 골라 한국어로 요약하고, 소식마다 공지방 스타일(STYLE.md)의 초안을 쓴다.
 4. 관리자 DM으로 보낸다: 요약 목록 1개 + 소식마다 원문 사진·영상을 붙인 초안 미리보기.
@@ -21,8 +21,8 @@ TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TG_ADMIN_ID = os.environ["TELEGRAM_ADMIN_ID"].strip()
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 # 한 번에 가져올 글 수 (10~100). 글 1개마다 X 읽기 요금이 붙는다.
-FETCH_COUNT = int(os.environ.get("TRENDS_FETCH_COUNT") or 50)
-WINDOW_HOURS = int(os.environ.get("TRENDS_WINDOW_HOURS") or 8)
+FETCH_COUNT = int(os.environ.get("TRENDS_FETCH_COUNT") or 30)
+WINDOW_HOURS = int(os.environ.get("TRENDS_WINDOW_HOURS") or 6)
 QUERY = os.environ.get("TRENDS_QUERY") or (
     "(Hyperliquid OR HyperEVM OR HyperCore OR $HYPE OR \"HIP-3\" OR HIP3) -is:retweet -is:reply")
 TOP_N = 5
