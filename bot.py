@@ -495,11 +495,29 @@ def set_footer(msg):
                   f"{sum(e['type'] == 'text_link' for e in ents)}개).\n다음 트렌드 리포트부터 이 푸터가 붙습니다.{warn}")
 
 
+def handle_write(msg):
+    """관리자가 보낸 X·웹사이트 링크로 공지방 스타일 초안을 써 준다 (writer.py)."""
+    import writer  # Claude·X 조회 코드는 글쓰기 요청이 올 때만 불러온다
+
+    reply = msg.get("reply_to_message") or {}
+    prev = strip_footer(post_text(reply)) if (reply.get("from") or {}).get("is_bot") else ""
+    print(f"[글쓰기 요청] 이전 초안 {'있음' if prev else '없음'}")
+    try:
+        writer.handle(msg, post_text(msg), prev)
+    except Exception as e:
+        print(f"  ✗ 초안 작성 실패: {e}")
+        tg_quiet("sendMessage", chat_id=TG_ADMIN_ID, text=f"⚠️ 초안 작성 실패\n\n{str(e)[:500]}")
+
+
 def handle_dm(msg):
     text = msg.get("text") or ""
-    if msg["chat"]["type"] != "private" or not text.startswith(("/start", "/id", "/status", "/footer")):
+    if msg["chat"]["type"] != "private":
         return
     uid = str(msg["from"]["id"])
+    if not text.startswith(("/start", "/id", "/status", "/footer")):
+        if TG_ADMIN_ID and uid == TG_ADMIN_ID and not DRY_RUN:
+            handle_write(msg)
+        return
     if text.startswith("/footer"):
         print(f"[DM /footer] user {uid}")
         if not DRY_RUN and TG_ADMIN_ID and uid == TG_ADMIN_ID:

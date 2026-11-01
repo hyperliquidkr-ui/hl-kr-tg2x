@@ -36,4 +36,5 @@ jobs:
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
           X_MAX_WEIGHT: ${{ vars.X_MAX_WEIGHT || '25000' }}  # Premium 계정 기준. 일반 계정이면 Variables에 280
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}  # DM으로 보낸 링크로 공지 초안 쓰기
           RUN_SECS: "3300"  # 한 번 실행되면 55분간 대기하며 바로 반응. 끝나면 대기 중인 다음 실행이 이어받음
