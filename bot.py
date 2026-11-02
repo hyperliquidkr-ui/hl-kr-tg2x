@@ -625,17 +625,25 @@ def main():
             params["offset"] = offset  # 이전 업데이트는 처리 완료로 확인된다
         try:
             updates = tg("getUpdates", **params)
-        except RuntimeError as e:
+        except Exception as e:  # 일시적인 네트워크 오류로 봇이 멈추지 않게 잠시 뒤 다시 시도한다
             if "webhook" in str(e).lower():
                 sys.exit("이 봇에 webhook이 설정되어 있습니다. deleteWebhook을 먼저 호출하세요.")
-            raise
-        done_id, err = process(updates, auth) if updates else (None, False)
+            print(f"  ! 텔레그램 연결 오류, 5초 뒤 다시 시도: {e}")
+            time.sleep(5)
+            continue
+        try:
+            done_id, err = process(updates, auth) if updates else (None, False)
+        except Exception as e:
+            # 예상 못 한 오류: 같은 메시지에서 계속 멈추지 않도록 이번 묶음은 넘기고 관리자에게 알린다
+            print(f"  ✗ 처리 중 오류: {e}")
+            tg_quiet("sendMessage", chat_id=TG_ADMIN_ID, text=f"⚠️ 봇 처리 중 오류 (해당 메시지는 건너뜀)\n\n{str(e)[:500]}")
+            done_id, err = updates[-1]["update_id"], True
         if done_id is not None:
             offset = done_id + 1
         if err:
             failed = True
             if done_id is None or done_id != updates[-1]["update_id"]:
-                break  # 승인 요청을 못 보낸 공지는 다음 실행 때 다시 시도
+                time.sleep(20)  # 승인 요청을 못 보낸 공지는 잠시 뒤 다시 시도
         if time.time() >= deadline:
             break
         if updates and done_id != updates[-1]["update_id"]:
@@ -644,7 +652,7 @@ def main():
     if DRY_RUN:
         print("(DRY_RUN: 아무것도 보내지 않았고, 텔레그램에도 처리 완료로 표시하지 않았습니다)")
     elif offset:
-        tg("getUpdates", offset=offset, limit=1, timeout=0)  # 마지막 처리분까지 확인
+        tg_quiet("getUpdates", offset=offset, limit=1, timeout=0)  # 마지막 처리분까지 확인
     if failed:
         sys.exit(1)
 
