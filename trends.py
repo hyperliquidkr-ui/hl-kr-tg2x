@@ -273,12 +273,24 @@ def load_footer():
     return DEFAULT_FOOTER, ents
 
 
+TITLE_MAX = 60  # 이보다 긴 첫 줄은 제목이 아니라 본문으로 본다 (제목 없이 시작하는 1인칭 번역 등)
+
+
+def title_entity(draft):
+    """첫 줄이 제목(짧은 한 줄 + 빈 줄)이면 굵게 표시할 서식을 돌려준다."""
+    first, sep, rest = draft.partition("\n\n")
+    if sep and rest.strip() and "\n" not in first and 0 < len(first) <= TITLE_MAX:
+        return [{"type": "bold", "offset": 0, "length": u16(first)}]
+    return []
+
+
 def compose(draft, footer):
-    """초안 + 푸터를 하나의 (글자, 서식)으로 합친다. 푸터 서식은 위치만 뒤로 민다."""
-    head = draft.strip() + "\n\n"
+    """초안 + 푸터를 하나의 (글자, 서식)으로 합친다. 제목은 굵게, 푸터 서식은 위치만 뒤로 민다."""
+    draft = draft.strip()
+    head = draft + "\n\n"
     ftext, fents = footer
     shift = u16(head)
-    return head + ftext, [dict(e, offset=e["offset"] + shift) for e in fents]
+    return head + ftext, title_entity(draft) + [dict(e, offset=e["offset"] + shift) for e in fents]
 
 
 def send_media(p, caption=None):
