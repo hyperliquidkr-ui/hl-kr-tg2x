@@ -10,6 +10,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: write  # 제안 기록(history.json)을 trends-state 브랜치에 저장
+
 concurrency:
   group: trends
   cancel-in-progress: false
@@ -25,6 +28,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Load proposal history
+        run: |
+          git fetch -q --depth=1 origin trends-state && git show origin/trends-state:history.json > history.json \
+            || echo "[]" > history.json
       - run: python trends.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -37,3 +44,15 @@ jobs:
           TRENDS_FETCH_COUNT: ${{ vars.TRENDS_FETCH_COUNT || '30' }}  # 한 번에 가져올 X 글 수 (비용 = 글 수 × 약 7원)
           TRENDS_WINDOW_HOURS: "6"  # cron 간격과 같게 (겹치거나 빠지는 시간 없이)
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+      - name: Save proposal history
+        if: ${{ !inputs.dry_run }}
+        run: |
+          cp history.json "$RUNNER_TEMP/history.json"
+          git config user.name "trends-bot"
+          git config user.email "trends-bot@users.noreply.github.com"
+          git checkout -q --orphan trends-state
+          git rm -rq --cached .
+          cp "$RUNNER_TEMP/history.json" history.json
+          git add -f history.json
+          git commit -qm "trends history $(date -u +%FT%TZ)"
+          git push -qf origin trends-state

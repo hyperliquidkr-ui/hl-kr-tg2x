@@ -27,6 +27,9 @@ QUERY = os.environ.get("TRENDS_QUERY") or (
     "(Hyperliquid OR HyperEVM OR HyperCore OR $HYPE OR \"HIP-3\" OR HIP3) -is:retweet -is:reply")
 TOP_N = 5
 CANDIDATES = 15  # Claude에게 넘길 후보 수 (스팸 걸러내고 Top 5 고르기용)
+# 이전에 제안한 소식 기록. 같은 소식이 다음 리포트에 또 나오지 않게 한다 (워크플로가 trends-state 브랜치에 보관).
+HISTORY_FILE = Path(os.environ.get("TRENDS_HISTORY") or "history.json")
+HISTORY_HOURS = 72
 
 STYLE = (Path(__file__).parent / "STYLE.md").read_text(encoding="utf-8")
 # 푸터는 관리자 DM에 고정된 메시지를 그대로 쓴다. 공지방 푸터의 로고는 커스텀 이모지라
@@ -209,7 +212,29 @@ def ask_claude(system, content, fields):
     return json.loads(next(b.text for b in response.content if b.type == "text"))["items"]
 
 
-def select(candidates):
+def load_history():
+    try:
+        items = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    cutoff = datetime.now(timezone.utc).timestamp() - HISTORY_HOURS * 3600
+    return [h for h in items if h.get("ts", 0) >= cutoff]
+
+
+def save_history(history, selected):
+    now = datetime.now(timezone.utc).timestamp()
+    history = history + [{"id": p["id"], "quoted_id": p["quoted_id"], "url": p["url"],
+                           "summary": summary, "ts": now} for summary, p in selected]
+    HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def drop_seen(posts, history):
+    """이미 제안한 글, 그 글을 인용한 글, 같은 원문을 인용한 글은 뺀다."""
+    seen = {h["id"] for h in history} | {h["quoted_id"] for h in history if h.get("quoted_id")}
+    return [p for p in posts if p["id"] not in seen and p["quoted_id"] not in seen]
+
+
+def select(candidates, history=()):
     """1단계: 글 텍스트만 보고 Top N을 고른다 (이미지를 안 넣어 저렴)."""
     listing = "\n\n".join(
         f"[{i}] @{p['author']} (팔로워 {p['followers']:,}) "
@@ -217,7 +242,12 @@ def select(candidates):
         f"{' [' + p['media'] + ' 첨부]' if p['media'] else ''}\n{p['url']}\n{p['text']}"
         for i, p in enumerate(candidates)
     )
-    items = ask_claude(SELECT_SYSTEM, f"지난 {WINDOW_HOURS}시간 X 후보 글:\n\n{listing}", ["summary_ko"])
+    content = f"지난 {WINDOW_HOURS}시간 X 후보 글:\n\n{listing}"
+    if history:
+        recent = "\n".join(f"- {h['summary']}" for h in history)
+        content += ("\n\n최근 3일 동안 이미 제안한 소식 (같은 발표·사건·수치를 다룬 글은 "
+                    f"눈에 띄는 새 진전이 없으면 고르지 마세요):\n{recent}")
+    items = ask_claude(SELECT_SYSTEM, content, ["summary_ko"])
     return [(it["summary_ko"], candidates[it["index"]]) for it in items[:TOP_N]
             if 0 <= it["index"] < len(candidates)]
 
@@ -354,8 +384,11 @@ def main():
         print(f"X에서 {len(posts)}개 가져옴")
         if not posts:
             return  # 새 화제글이 없으면 아무것도 보내지 않는다
-        candidates = sorted(posts, key=score, reverse=True)[:CANDIDATES]
-        selected = select(candidates)
+        history = load_history()
+        fresh = drop_seen(posts, history)
+        print(f"이전에 제안한 글 {len(posts) - len(fresh)}개 제외")
+        candidates = sorted(fresh, key=score, reverse=True)[:CANDIDATES]
+        selected = select(candidates, history) if candidates else []
         drafts = write_drafts([p for _, p in selected]) if selected else {}
     except Exception as e:
         tg_send(f"⚠️ Hyperliquid 트렌드 리포트 실패 ({now})\n\n{str(e)[:800]}")
@@ -372,6 +405,8 @@ def main():
         except Exception as e:
             print(f"  ✗ 초안 전송 실패: {e}")
             tg_send(f"⚠️ 초안 전송 실패: {str(e)[:300]}\n\n{draft}")
+    if not DRY_RUN:
+        save_history(history, selected)
 
 
 if __name__ == "__main__":
