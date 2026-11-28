@@ -11,14 +11,36 @@ on:
         default: false
 
 permissions:
-  contents: write  # 제안 기록(history.json)을 trends-state 브랜치에 저장
+  contents: write
+  actions: read  # 중복 실행 확인용  # 제안 기록(history.json)을 trends-state 브랜치에 저장
 
 concurrency:
   group: trends
   cancel-in-progress: false
 
 jobs:
+  # 봇이 이미 시간 맞춰 실행시켰으면, 늦게 도착한 GitHub 예약 실행은 건너뛴다 (중복 초안 방지)
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          skip=false
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            since=$(date -u -d '-90 min' +%FT%TZ)
+            n=$(gh run list -R "${{ github.repository }}" -w "${{ github.workflow_ref }}" --created ">=$since" \
+                --json databaseId --jq '[.[] | select(.databaseId != ${{ github.run_id }})] | length' 2>/dev/null || echo 0)
+            [ "${n:-0}" -gt 0 ] && skip=true
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
   trends:
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

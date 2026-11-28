@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 from requests_oauthlib import OAuth1
@@ -536,6 +537,49 @@ def handle_dm(msg):
     tg_quiet("sendMessage", chat_id=msg["chat"]["id"], text=reply)
 
 
+# ---------------------------------------------------------------- 예약 실행
+
+# GitHub 예약 실행(cron)은 자주 늦거나 건너뛴다. 항상 켜져 있는 이 봇이 시간에 맞춰 직접 실행시킨다.
+# (워크플로, UTC 시, 분) — 한국 시간 = UTC + 9
+SCHEDULES = [
+    ("trends.yml", 0, 0), ("trends.yml", 6, 0), ("trends.yml", 12, 0), ("trends.yml", 18, 0),
+    ("scorecard.yml", 13, 30),
+]
+SCHEDULE_WINDOW = timedelta(minutes=50)  # 이 시간 안에 이미 실행된 게 없으면 실행시킨다
+GH_REPO = os.environ.get("GITHUB_REPOSITORY", "")
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
+TRIGGERED = set()
+
+
+def gh_api(method, path, **kw):
+    r = requests.request(method, f"https://api.github.com/repos/{GH_REPO}/{path}", timeout=30,
+                         headers={"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}, **kw)
+    if r.status_code >= 300:
+        raise RuntimeError(f"GitHub {path} 실패 ({r.status_code}): {r.text[:200]}")
+    return r.json() if r.text else {}
+
+
+def run_due_workflows(now=None):
+    if DRY_RUN or not (GH_REPO and GH_TOKEN):
+        return
+    now = now or datetime.now(timezone.utc)
+    for wf, hour, minute in SCHEDULES:
+        slot = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if slot > now:
+            slot -= timedelta(days=1)
+        if now - slot >= SCHEDULE_WINDOW or (wf, slot) in TRIGGERED:
+            continue
+        try:
+            since = slot.strftime("%Y-%m-%dT%H:%M:%SZ")
+            runs = gh_api("GET", f"actions/workflows/{wf}/runs", params={"created": f">={since}", "per_page": 1})
+            if not runs.get("total_count"):
+                gh_api("POST", f"actions/workflows/{wf}/dispatches", json={"ref": "main"})
+                print(f"[예약 실행] {wf} ({since})")
+            TRIGGERED.add((wf, slot))
+        except Exception as e:
+            print(f"  ! 예약 실행 확인 실패 ({wf}): {e}")
+
+
 # ---------------------------------------------------------------- 메인 루프
 
 def group_items(updates):
@@ -619,6 +663,7 @@ def main():
         if wait == 0 and not first:
             break
         first = False
+        run_due_workflows()
         params = dict(timeout=wait, limit=100,
                       allowed_updates=["channel_post", "message", "callback_query"])
         if offset:
